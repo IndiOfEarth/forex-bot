@@ -2,15 +2,22 @@ from datetime import datetime, timezone
 
 from oanda.client import OandaClient
 from oanda.market_data import MarketData
+from oanda.orders import OrderExecutor
 from econ_calendar.fetcher import fetch_weekly_events, get_todays_events, print_events
 from econ_calendar.filter import is_in_blackout, calculate_weekly_bias, print_weekly_bias, minutes_to_next_event
 from risk.manager import RiskManager
 from strategies.london_breakout import LondonBreakout
 from config import PAIRS, PRIMARY_PAIR
 
+# ── DRY RUN FLAG ───────────────────────────────────────────────
+# Set to False only when you're ready to place real practice orders
+DRY_RUN = True
+
 
 def main():
     print("\n[Forex Bot] Starting up...")
+    if DRY_RUN:
+        print("[Forex Bot] ⚠️  DRY RUN MODE — no orders will be placed.\n")
 
     # ── 1. OANDA Connection ────────────────────────────────────
     client = OandaClient()
@@ -69,13 +76,41 @@ def main():
     )
     signals = breakout.scan(events=todays_events, bias=bias)
 
+    # ── 9. Execution ──────────────────────────────────────────
+    executor = OrderExecutor(client=client, market_data=md, risk=risk)
+
     if signals:
-        print(f"\n[London Breakout] {len(signals)} signal(s) ready to execute.")
+        print(f"\n[Executor] {len(signals)} signal(s) ready.")
+        for signal in signals:
+            if DRY_RUN:
+                # Show what would be placed without touching the market
+                scalar = 0.5 if bias.get("is_fomc_week") else 1.0
+                units  = risk.calculate_units(
+                    pair=signal.pair,
+                    direction=signal.direction,
+                    stop_pips=signal.stop_pips,
+                    scalar=scalar,
+                )
+                print(f"\n[DRY RUN] Would place:")
+                print(f"  Pair        : {signal.pair}")
+                print(f"  Direction   : {signal.direction.upper()}")
+                print(f"  Units       : {units:+,}")
+                print(f"  Entry       : {signal.entry_price:.5f}")
+                print(f"  Stop Loss   : {signal.stop_loss:.5f}")
+                print(f"  Take Profit : {signal.take_profit:.5f}")
+                print(f"  RR          : 1:{signal.rr_ratio}")
+            else:
+                scalar = 0.5 if bias.get("is_fomc_week") else 1.0
+                executor.execute_signal(signal, scalar=scalar, label="london_breakout")
+                breakout.mark_fired(signal.pair)
     else:
-        print(f"\n[London Breakout] No signals this scan.")
+        print(f"\n[Executor] No signals to execute.")
+
+    # ── 10. Open Trades ───────────────────────────────────────
+    executor.print_open_trades()
 
     print("\n[Forex Bot] All systems running. ✓")
-    print("[Forex Bot] Next: oanda/orders.py — order execution layer.\n")
+    print("[Forex Bot] Next: backtest/engine.py\n")
 
 
 if __name__ == "__main__":
