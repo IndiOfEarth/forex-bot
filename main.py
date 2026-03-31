@@ -5,6 +5,7 @@ from oanda.market_data import MarketData
 from econ_calendar.fetcher import fetch_weekly_events, get_todays_events, print_events
 from econ_calendar.filter import is_in_blackout, calculate_weekly_bias, print_weekly_bias, minutes_to_next_event
 from risk.manager import RiskManager
+from strategies.london_breakout import LondonBreakout
 from config import PAIRS, PRIMARY_PAIR
 
 
@@ -58,17 +59,23 @@ def main():
     risk = RiskManager(client)
     risk.print_risk_status()
 
-    # ── 8. Sample pre-trade check ─────────────────────────────
-    print("[Pre-Trade Check Sample — EUR_USD BUY, 20 pip stop, 50 pip target]")
-    risk.pre_trade_check(
-        pair="EUR_USD",
-        direction="buy",
-        stop_pips=20,
-        target_pips=50,
+    # ── 8. London Breakout Scan ───────────────────────────────
+    print("[London Breakout] Running scan...\n")
+    breakout = LondonBreakout(
+        client=client,
+        market_data=md,
+        risk_manager=risk,
+        pairs=["EUR_USD", "GBP_USD"],
     )
+    signals = breakout.scan(events=todays_events, bias=bias)
 
-    print("\n[Forex Bot] Core foundation complete. ✓")
-    print("[Forex Bot] Next: strategies/london_breakout.py\n")
+    if signals:
+        print(f"\n[London Breakout] {len(signals)} signal(s) ready to execute.")
+    else:
+        print(f"\n[London Breakout] No signals this scan.")
+
+    print("\n[Forex Bot] All systems running. ✓")
+    print("[Forex Bot] Next: oanda/orders.py — order execution layer.\n")
 
 
 if __name__ == "__main__":
