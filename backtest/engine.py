@@ -103,6 +103,15 @@ class StrategyParams:
     # Filters out counter-trend and ranging-market false breakouts.
     require_trend_alignment: bool  = False
 
+    # ── Direction filter ──────────────────────────────────────
+    # Controls which trade directions the strategy is allowed to take.
+    # Default: both directions.
+    # Set to ["buy"] to only take long breakouts — use for pairs with
+    # a structural upside bias (e.g. GBP/USD in 2023-2026 dataset).
+    # Set to ["sell"] to only take short breakouts.
+    # This is pair-specific — pass a different StrategyParams per pair.
+    allowed_directions: tuple = ("buy", "sell")
+
 
 # ── Main Engine ────────────────────────────────────────────────
 
@@ -306,6 +315,9 @@ class BacktestEngine:
             bar_trend = bar.get("trend_state", "ranging")
 
             if bar["high"] >= long_entry and direction is None:
+                # Direction filter — skip if longs not allowed
+                if "buy" not in p.allowed_directions:
+                    continue
                 if p.require_trend_alignment and bar_trend != "bullish":
                     continue
                 direction    = "buy"
@@ -317,6 +329,9 @@ class BacktestEngine:
                 break
 
             elif bar["low"] <= short_entry and direction is None:
+                # Direction filter — skip if shorts not allowed
+                if "sell" not in p.allowed_directions:
+                    continue
                 if p.require_trend_alignment and bar_trend != "bearish":
                     continue
                 direction    = "sell"

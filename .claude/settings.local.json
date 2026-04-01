@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip list:*)",
+      "Bash(/Users/indicaburian/code/forex-bot/venv/bin/pip list:*)"
+    ]
+  }
+}
