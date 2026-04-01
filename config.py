@@ -28,6 +28,17 @@ MAX_DAILY_LOSS      = 0.04   # 4% daily loss kill-switch
 MAX_OPEN_POSITIONS  = 2
 MIN_REWARD_RISK     = 2.0    # minimum 1:2 RR
 
+# ── Exit Management ────────────────────────────────────────────
+TRAIL_TRIGGER_R   = 1.0   # Move SL to break-even after 1R profit
+TRAIL_LOCK_R      = 0.5   # Lock in 0.5R on remainder after partial close
+PARTIAL_CLOSE_R   = 1.5   # Close PARTIAL_CLOSE_PCT of position at 1.5R
+PARTIAL_CLOSE_PCT = 0.5   # Fraction of position to close at partial close level
+FULL_TP_R         = 3.5   # TP for remaining position after partial close
+
+# ── Entry Quality ──────────────────────────────────────────────
+BREAKOUT_ASIAN_MIN_PIPS = 20    # Minimum Asian range (raised from 10)
+MOMENTUM_BODY_RATIO     = 0.6   # Breakout bar body must be >= 60% of bar range
+
 # ── Session Windows (UTC hours) ────────────────────────────────
 SESSIONS = {
     "london_open":  {"start": 7,  "end": 9},

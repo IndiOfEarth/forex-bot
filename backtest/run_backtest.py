@@ -1,13 +1,18 @@
 """
-Walk-forward backtest — direction filter added.
+Walk-forward backtest — direction filter + exit improvements + entry quality.
 
-Runs four combinations per pair:
-  1. Base (no filters)
-  2. Trend filter only
-  3. Trend filter + long only  (relevant for GBP/USD)
-  4. Trend filter + short only (for completeness)
+Configs per pair:
+  1.  base                    — no filters, both directions (baseline)
+  2.  trend_filter            — EMA 21/50/200 alignment required
+  3.  trend_long_only         — trend filter + long only (GBP/USD validated)
+  4.  trend_short_only        — trend filter + short only (for reference)
+  5.  trend_trailing          — trend filter + trailing stop + partial close
+  6.  trend_trailing_lo       — config 5 + long only (GBP/USD best config)
+  7.  trend_all               — config 5 + min range 20 pips + body ratio filter
+  8.  trend_all_lo            — config 7 + long only
 
-Compare OOS aggregates to find the best combination per pair.
+Configs 5–8 implement Phase 1+2 improvements. Compare OOS pips vs configs 2–4
+to decide which to activate in the live strategy.
 """
 
 import sys, os
@@ -16,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from oanda.client import OandaClient
 from backtest.data_loader import fetch_historical
 from backtest.engine import BacktestEngine, StrategyParams
+from config import TRAIL_TRIGGER_R, TRAIL_LOCK_R, PARTIAL_CLOSE_R, PARTIAL_CLOSE_PCT, FULL_TP_R
 
 
 def run(pair: str, params: StrategyParams, df, label: str):
@@ -26,10 +32,26 @@ def run(pair: str, params: StrategyParams, df, label: str):
     results = engine.run_walk_forward(train_months=6, validate_months=2)
     engine.print_summary(results)
 
-    # Sanitise label for filename
     fname_label = label.lower().replace(" ", "_").replace("+", "").replace("/", "")
     fname = f"logs/backtest_{pair}_{fname_label}.csv"
     engine.export_trades(results, path=fname)
+
+
+# ── Reusable param blocks ──────────────────────────────────────
+
+TRAILING_PARAMS = dict(
+    trail_trigger_r=TRAIL_TRIGGER_R,
+    trail_lock_r=TRAIL_LOCK_R,
+    partial_close_r=PARTIAL_CLOSE_R,
+    partial_close_pct=PARTIAL_CLOSE_PCT,
+    full_tp_r=FULL_TP_R,
+)
+
+ALL_IMPROVEMENTS = dict(
+    **TRAILING_PARAMS,
+    min_range_pips=20.0,
+    require_body_ratio=True,
+)
 
 
 if __name__ == "__main__":
@@ -40,26 +62,55 @@ if __name__ == "__main__":
         if df.empty:
             continue
 
-        # 1. Base — no filters, both directions
+        long_only = pair == "GBP_USD"
+        lo_dirs   = ("buy",) if long_only else ("buy", "sell")
+
+        # ── Baseline configs (unchanged) ───────────────────────
         run(pair, StrategyParams(), df, "base")
 
-        # 2. Trend filter — both directions
         run(pair, StrategyParams(
             require_trend_alignment=True,
         ), df, "trend_filter")
 
-        # 3. Trend filter + long only
         run(pair, StrategyParams(
             require_trend_alignment=True,
             allowed_directions=("buy",),
         ), df, "trend_long_only")
 
-        # 4. Trend filter + short only
         run(pair, StrategyParams(
             require_trend_alignment=True,
             allowed_directions=("sell",),
         ), df, "trend_short_only")
 
+        # ── Phase 1+2 improvement configs ─────────────────────
+        # 5. Trend filter + trailing stop + partial close
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **TRAILING_PARAMS,
+        ), df, "trend_trailing")
+
+        # 6. Config 5 + per-pair direction restriction
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            allowed_directions=lo_dirs,
+            **TRAILING_PARAMS,
+        ), df, "trend_trailing_lo")
+
+        # 7. Config 5 + min range 20 pips + body ratio
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+        ), df, "trend_all")
+
+        # 8. Config 7 + per-pair direction restriction (fullest filter set)
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            allowed_directions=lo_dirs,
+            **ALL_IMPROVEMENTS,
+        ), df, "trend_all_lo")
+
     print("\n[Backtest] Done.\n")
-    print("Key comparison — OOS aggregate pips per combination:")
-    print("  Check logs/ for per-trade CSVs.")
+    print("OOS aggregate comparison — check logs/ for per-trade CSVs.")
+    print("Improvement targets vs baseline (trend_filter):")
+    print("  EUR_USD: PF > 1.40, OOS pips > +700")
+    print("  GBP_USD: PF > 1.25, OOS pips > +460")

@@ -6,7 +6,7 @@ from oanda.client import OandaClient
 from oanda.market_data import MarketData
 from risk.manager import RiskManager
 from strategies.london_breakout import BreakoutSignal
-from config import OANDA_ACCOUNT_ID
+from config import OANDA_ACCOUNT_ID, TRAIL_TRIGGER_R, TRAIL_LOCK_R, PARTIAL_CLOSE_R, PARTIAL_CLOSE_PCT
 
 
 class OrderExecutor:
@@ -166,48 +166,90 @@ class OrderExecutor:
             print(f"[Orders] ❌ Failed to modify SL on trade {trade_id}: {e}")
             return None
 
-    # ── Trailing Stop ──────────────────────────────────────────
+    # ── Trailing Stop + Partial Close ─────────────────────────
 
-    def apply_trailing_stop(self, trade_id: str, pair: str, entry: float, direction: str) -> bool:
+    def apply_trailing_stop(self, trade_id: str, pair: str, entry: float,
+                            direction: str, initial_sl: float) -> bool:
         """
-        Moves stop to break-even once trade is 1R in profit.
-        Call this on each bot loop iteration for open trades.
+        Two-stage exit management — call on each bot loop for open trades.
 
-        Returns True if stop was moved.
+        Stage 1 (TRAIL_TRIGGER_R = 1R profit):
+            Move SL to break-even + 1 pip.
+
+        Stage 2 (PARTIAL_CLOSE_R = 1.5R profit):
+            Close PARTIAL_CLOSE_PCT (50%) of the position.
+            Move SL to lock in TRAIL_LOCK_R (0.5R) on the remainder.
+
+        Returns True if any action was taken.
         """
         open_trades = self.get_open_trades()
         trade = next((t for t in open_trades if t["id"] == trade_id), None)
-
         if not trade:
             return False
 
-        current_price_data = self.client.get_price(pair)
-        current_price = (
-            current_price_data["bid"]
-            if direction == "sell"
-            else current_price_data["ask"]
-        )
+        price_data    = self.client.get_price(pair)
+        current_price = price_data["ask"] if direction == "buy" else price_data["bid"]
+        current_sl    = float(trade.get("stopLossOrder", {}).get("price", 0))
+        current_units = abs(int(trade.get("currentUnits", 0)))
+        r1_dist       = abs(entry - initial_sl)
+        acted         = False
 
-        current_sl  = float(trade.get("stopLossOrder", {}).get("price", 0))
-        unrealised  = float(trade.get("unrealizedPL", 0))
-        initial_risk = abs(entry - current_sl)
+        if direction == "buy":
+            trail_trigger_px   = entry + r1_dist * TRAIL_TRIGGER_R
+            partial_close_px   = entry + r1_dist * PARTIAL_CLOSE_R
+            lock_px            = entry + r1_dist * TRAIL_LOCK_R
+            be_px              = entry + self.md.pips_to_price(1, pair)
 
-        # Move to break-even when 1R in profit
-        if direction == "buy" and current_price >= entry + initial_risk:
-            new_sl = entry + self.md.pips_to_price(1, pair)  # 1 pip above entry
-            if new_sl > current_sl:
-                self.modify_stop_loss(trade_id, new_sl)
-                print(f"[Orders] Trailing stop: moved to break-even +1 pip on {pair}")
-                return True
+            # Stage 2: partial close + lock remainder
+            if current_price >= partial_close_px and current_sl < lock_px:
+                close_units = round(current_units * PARTIAL_CLOSE_PCT)
+                if close_units > 0:
+                    self._close_partial(trade_id, pair, close_units, direction)
+                if lock_px > current_sl:
+                    self.modify_stop_loss(trade_id, lock_px)
+                    print(f"[Orders] Trailing stop: locked 0.5R at {lock_px:.5f} on {pair}")
+                acted = True
 
-        elif direction == "sell" and current_price <= entry - initial_risk:
-            new_sl = entry - self.md.pips_to_price(1, pair)
-            if new_sl < current_sl:
-                self.modify_stop_loss(trade_id, new_sl)
-                print(f"[Orders] Trailing stop: moved to break-even +1 pip on {pair}")
-                return True
+            # Stage 1: move to break-even
+            elif current_price >= trail_trigger_px and current_sl < be_px:
+                self.modify_stop_loss(trade_id, be_px)
+                print(f"[Orders] Trailing stop: moved to break-even on {pair}")
+                acted = True
 
-        return False
+        else:  # sell
+            trail_trigger_px   = entry - r1_dist * TRAIL_TRIGGER_R
+            partial_close_px   = entry - r1_dist * PARTIAL_CLOSE_R
+            lock_px            = entry - r1_dist * TRAIL_LOCK_R
+            be_px              = entry - self.md.pips_to_price(1, pair)
+
+            # Stage 2: partial close + lock remainder
+            if current_price <= partial_close_px and current_sl > lock_px:
+                close_units = round(current_units * PARTIAL_CLOSE_PCT)
+                if close_units > 0:
+                    self._close_partial(trade_id, pair, close_units, direction)
+                if lock_px < current_sl:
+                    self.modify_stop_loss(trade_id, lock_px)
+                    print(f"[Orders] Trailing stop: locked 0.5R at {lock_px:.5f} on {pair}")
+                acted = True
+
+            # Stage 1: move to break-even
+            elif current_price <= trail_trigger_px and current_sl > be_px:
+                self.modify_stop_loss(trade_id, be_px)
+                print(f"[Orders] Trailing stop: moved to break-even on {pair}")
+                acted = True
+
+        return acted
+
+    def _close_partial(self, trade_id: str, pair: str, units: int, direction: str):
+        """Closes a partial number of units on an open trade."""
+        close_units = -units if direction == "buy" else units
+        try:
+            data = {"units": str(close_units)}
+            r = trades.TradeClose(self.client.account_id, tradeID=trade_id, data=data)
+            self.client.client.request(r)
+            print(f"[Orders] Partial close: {units:,} units on {pair} (trade {trade_id})")
+        except Exception as e:
+            print(f"[Orders] ❌ Partial close failed on {trade_id}: {e}")
 
     # ── End of Day Cleanup ─────────────────────────────────────
 
