@@ -16,8 +16,6 @@ PAIRS = [
     "EUR_USD",
     "GBP_USD",
     "USD_JPY",
-    "AUD_USD",
-    "USD_CAD",
 ]
 
 PRIMARY_PAIR = "EUR_USD"
@@ -25,7 +23,7 @@ PRIMARY_PAIR = "EUR_USD"
 # ── Risk Parameters ────────────────────────────────────────────
 RISK_PER_TRADE      = 0.01   # 1% of account per trade
 MAX_DAILY_LOSS      = 0.04   # 4% daily loss kill-switch
-MAX_OPEN_POSITIONS  = 2
+MAX_OPEN_POSITIONS  = 3
 MIN_REWARD_RISK     = 2.0    # minimum 1:2 RR
 
 # ── Exit Management ────────────────────────────────────────────

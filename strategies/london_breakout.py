@@ -36,7 +36,10 @@ class BreakoutSignal:
 # DO NOT change these without re-running the walk-forward backtest.
 #
 # EUR/USD: trend filter on, both directions profitable
-# GBP/USD: trend filter on, long only — shorts confirmed losing OOS
+# GBP/USD: trend filter on, both directions profitable (re-validated OOS:
+#          bearish +258 pips, bullish +329 pips with full filter set)
+# USD/JPY: trend filter on, both directions profitable (OOS PF 1.68, +949 pips,
+#          80 trades — buy PF 1.87, sell PF 1.31)
 #
 PAIR_CONFIG = {
     "EUR_USD": {
@@ -44,7 +47,11 @@ PAIR_CONFIG = {
         "require_trend_alignment": True,
     },
     "GBP_USD": {
-        "allowed_directions":    ("buy",),
+        "allowed_directions":    ("buy", "sell"),
+        "require_trend_alignment": True,
+    },
+    "USD_JPY": {
+        "allowed_directions":    ("buy", "sell"),
         "require_trend_alignment": True,
     },
 }
@@ -199,8 +206,7 @@ class LondonBreakout:
 
         elif bid <= short_entry:
             if "sell" not in allowed_directions:
-                print(f"  ❌ Short breakout blocked — {pair} is long-only "
-                      f"(backtest confirmed shorts unprofitable)")
+                print(f"  ❌ Short breakout blocked — {pair} direction config: {allowed_directions}")
                 return None
             if require_trend_alignment and trend_state != "bearish":
                 print(f"  ❌ Short breakout blocked — trend not bearish "

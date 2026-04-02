@@ -4,10 +4,10 @@ Walk-forward backtest — direction filter + exit improvements + entry quality.
 Configs per pair:
   1.  base                    — no filters, both directions (baseline)
   2.  trend_filter            — EMA 21/50/200 alignment required
-  3.  trend_long_only         — trend filter + long only (GBP/USD validated)
+  3.  trend_long_only         — trend filter + long only
   4.  trend_short_only        — trend filter + short only (for reference)
   5.  trend_trailing          — trend filter + trailing stop + partial close
-  6.  trend_trailing_lo       — config 5 + long only (GBP/USD best config)
+  6.  trend_trailing_lo       — config 5 + long only
   7.  trend_all               — config 5 + min range 20 pips + body ratio filter
   8.  trend_all_lo            — config 7 + long only
 
@@ -57,13 +57,12 @@ ALL_IMPROVEMENTS = dict(
 if __name__ == "__main__":
     client = OandaClient()
 
-    for pair in ["EUR_USD", "GBP_USD"]:
+    for pair in ["EUR_USD", "GBP_USD", "USD_JPY", "USD_CAD"]:
         df = fetch_historical(client, pair=pair, granularity="M15", years=3)
         if df.empty:
             continue
 
-        long_only = pair == "GBP_USD"
-        lo_dirs   = ("buy",) if long_only else ("buy", "sell")
+        lo_dirs = ("buy", "sell")  # all pairs: both directions tested
 
         # ── Baseline configs (unchanged) ───────────────────────
         run(pair, StrategyParams(), df, "base")
@@ -114,3 +113,5 @@ if __name__ == "__main__":
     print("Improvement targets vs baseline (trend_filter):")
     print("  EUR_USD: PF > 1.40, OOS pips > +700")
     print("  GBP_USD: PF > 1.25, OOS pips > +460")
+    print("  USD_JPY: acceptance gate — OOS PF > 1.2 and > 30 OOS trades")
+    print("  USD_CAD: acceptance gate — OOS PF > 1.2 and > 30 OOS trades")

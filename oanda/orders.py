@@ -29,7 +29,8 @@ class OrderExecutor:
         units:       int,       # positive = buy, negative = sell
         stop_loss:   float,
         take_profit: float,
-        label:       str = "",  # strategy tag for logs
+        label:       str   = "",     # strategy tag for logs
+        initial_sl:  float | None = None,  # persisted for trailing stop logic
     ) -> dict | None:
         """
         Places a market order with attached SL and TP.
@@ -52,8 +53,11 @@ class OrderExecutor:
             }
         }
 
-        if label:
-            data["order"]["clientExtensions"] = {"comment": label[:128]}
+        comment = label
+        if initial_sl is not None:
+            comment = f"{label}|isl={initial_sl:.5f}"
+        if comment:
+            data["order"]["clientExtensions"] = {"comment": comment[:128]}
 
         try:
             r = orders.OrderCreate(self.client.account_id, data=data)
@@ -118,6 +122,7 @@ class OrderExecutor:
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit,
             label=label,
+            initial_sl=signal.stop_loss,
         )
 
     # ── Trade Management ───────────────────────────────────────

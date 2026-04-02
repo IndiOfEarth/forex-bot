@@ -72,7 +72,7 @@ def main():
         client=client,
         market_data=md,
         risk_manager=risk,
-        pairs=["EUR_USD", "GBP_USD"],
+        pairs=["EUR_USD", "GBP_USD", "USD_JPY"],
     )
     signals = breakout.scan(events=todays_events, bias=bias)
 
@@ -109,8 +109,34 @@ def main():
     # ── 10. Open Trades ───────────────────────────────────────
     executor.print_open_trades()
 
+    # ── 11. Trailing Stop Management ──────────────────────────
+    if not DRY_RUN:
+        open_trades = executor.get_open_trades()
+        managed = 0
+        for trade in open_trades:
+            comment  = trade.get("clientExtensions", {}).get("comment", "")
+            isl_part = next((p for p in comment.split("|") if p.startswith("isl=")), None)
+            if isl_part is None:
+                continue  # trade not opened by this bot — skip
+
+            entry      = float(trade["price"])
+            initial_sl = float(isl_part[4:])
+            direction  = "buy" if int(trade["currentUnits"]) > 0 else "sell"
+            acted = executor.apply_trailing_stop(
+                trade_id=trade["id"],
+                pair=trade["instrument"],
+                entry=entry,
+                direction=direction,
+                initial_sl=initial_sl,
+            )
+            if acted:
+                managed += 1
+
+        if open_trades:
+            print(f"[Trailing Stop] Checked {len(open_trades)} trade(s), "
+                  f"acted on {managed}.\n")
+
     print("\n[Forex Bot] All systems running. ✓")
-    print("[Forex Bot] Next: backtest/engine.py\n")
 
 
 if __name__ == "__main__":
