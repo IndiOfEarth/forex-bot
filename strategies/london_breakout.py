@@ -35,24 +35,35 @@ class BreakoutSignal:
 # Derived directly from backtest results.
 # DO NOT change these without re-running the walk-forward backtest.
 #
-# EUR/USD: trend filter on, both directions profitable
-# GBP/USD: trend filter on, both directions profitable (re-validated OOS:
-#          bearish +258 pips, bullish +329 pips with full filter set)
-# USD/JPY: trend filter on, both directions profitable (OOS PF 1.68, +949 pips,
-#          80 trades — buy PF 1.87, sell PF 1.31)
+# EUR/USD: 4H trend confirmation (H1 + H4 EMA stack must agree).
+#          OOS PF improved 1.72 → 1.99, max DD halved.
+#          first_bar_minutes=0 — EUR breakouts can develop throughout 07–09 window.
+#
+# GBP/USD: first_bar_minutes=15 — only accept the 07:00 bar.
+#          Later bars are reversals, not extensions. OOS PF 1.27 → 1.71.
+#
+# USD/JPY: first_bar_minutes=15 — 07:00 bar dominates. PF 1.68 → 6.90 (14 OOS
+#          trades, spread across 11/15 windows). 30-min version: PF 2.65 (23 trades).
+#          Using 15m; watch closely in paper trading given small OOS sample.
 #
 PAIR_CONFIG = {
     "EUR_USD": {
-        "allowed_directions":    ("buy", "sell"),
+        "allowed_directions":      ("buy", "sell"),
         "require_trend_alignment": True,
+        "require_4h_trend":        True,
+        "first_bar_minutes":       0,
     },
     "GBP_USD": {
-        "allowed_directions":    ("buy", "sell"),
+        "allowed_directions":      ("buy", "sell"),
         "require_trend_alignment": True,
+        "require_4h_trend":        False,
+        "first_bar_minutes":       15,
     },
     "USD_JPY": {
-        "allowed_directions":    ("buy", "sell"),
+        "allowed_directions":      ("buy", "sell"),
         "require_trend_alignment": True,
+        "require_4h_trend":        False,
+        "first_bar_minutes":       15,
     },
 }
 
@@ -77,9 +88,10 @@ class LondonBreakout:
       7. Take profit: entry + (stop_distance * 2.5R)
     """
 
-    MIN_RANGE_PIPS = BREAKOUT_ASIAN_MIN_PIPS
-    MAX_RANGE_PIPS = 80
-    REWARD_RISK    = 2.5
+    MIN_RANGE_PIPS   = BREAKOUT_ASIAN_MIN_PIPS
+    MAX_RANGE_PIPS   = 80
+    REWARD_RISK      = 2.5
+    LONDON_OPEN_HOUR = 7
 
     def __init__(
         self,
@@ -137,17 +149,29 @@ class LondonBreakout:
         cfg = PAIR_CONFIG.get(pair, {
             "allowed_directions":      ("buy", "sell"),
             "require_trend_alignment": True,
+            "require_4h_trend":        False,
+            "first_bar_minutes":       0,
         })
-        allowed_directions     = cfg["allowed_directions"]
+        allowed_directions      = cfg["allowed_directions"]
         require_trend_alignment = cfg["require_trend_alignment"]
+        require_4h_trend        = cfg.get("require_4h_trend", False)
+        first_bar_minutes       = cfg.get("first_bar_minutes", 0)
 
-        # 1. News blackout
+        # 1. First-bar filter — before any API calls
+        if first_bar_minutes > 0:
+            minutes_past_open = now.hour * 60 + now.minute - self.LONDON_OPEN_HOUR * 60
+            if minutes_past_open >= first_bar_minutes:
+                print(f"  ❌ Outside first-bar window "
+                      f"({minutes_past_open}min past open, limit {first_bar_minutes}min)")
+                return None
+
+        # 2. News blackout
         blocked, reason = is_in_blackout(events, now=now)
         if blocked:
             print(f"  ❌ Blocked — {reason}")
             return None
 
-        # 2. Asian session range
+        # 3. Asian session range
         asian = self.md.get_asian_range(pair)
         if not asian:
             print(f"  ❌ Asian range unavailable.")
@@ -184,33 +208,43 @@ class LondonBreakout:
         print(f"  Short entry : {short_entry:.5f}  (asian low  - {BREAKOUT_BUFFER_PIPS} pips)")
         print(f"  Current mid : {mid:.5f}")
 
-        # 6. Trend state — read current EMA stack from H1 data
+        # 6. Trend state — H1 EMA stack
         trend_state = self._get_trend_state(pair)
-        print(f"  Trend state : {trend_state.upper()}")
+        print(f"  H1 trend    : {trend_state.upper()}")
 
-        # 7. Detect breakout direction, apply direction + trend filters
+        # 7. 4H trend confirmation (EUR/USD only — per PAIR_CONFIG)
+        if require_4h_trend:
+            h4_trend = self._get_h4_trend_state(pair)
+            print(f"  H4 trend    : {h4_trend.upper()}")
+        else:
+            h4_trend = None
+
+        # 8. Detect breakout direction, apply direction + trend filters
         direction   = None
         entry_price = None
 
         if ask >= long_entry:
             if "buy" not in allowed_directions:
-                print(f"  ❌ Long breakout blocked — {pair} long only? "
-                      f"No, direction config: {allowed_directions}")
+                print(f"  ❌ Long breakout blocked — direction config: {allowed_directions}")
                 return None
             if require_trend_alignment and trend_state != "bullish":
-                print(f"  ❌ Long breakout blocked — trend not bullish "
-                      f"(EMA stack: {trend_state})")
+                print(f"  ❌ Long breakout blocked — H1 trend not bullish ({trend_state})")
+                return None
+            if require_4h_trend and h4_trend != "bullish":
+                print(f"  ❌ Long breakout blocked — H4 trend not bullish ({h4_trend})")
                 return None
             direction   = "buy"
             entry_price = ask
 
         elif bid <= short_entry:
             if "sell" not in allowed_directions:
-                print(f"  ❌ Short breakout blocked — {pair} direction config: {allowed_directions}")
+                print(f"  ❌ Short breakout blocked — direction config: {allowed_directions}")
                 return None
             if require_trend_alignment and trend_state != "bearish":
-                print(f"  ❌ Short breakout blocked — trend not bearish "
-                      f"(EMA stack: {trend_state})")
+                print(f"  ❌ Short breakout blocked — H1 trend not bearish ({trend_state})")
+                return None
+            if require_4h_trend and h4_trend != "bearish":
+                print(f"  ❌ Short breakout blocked — H4 trend not bearish ({h4_trend})")
                 return None
             direction   = "sell"
             entry_price = bid
@@ -305,6 +339,32 @@ class LondonBreakout:
         df = self.md.add_emas(df)
         last = df.iloc[-1]
 
+        e21  = last[f"ema_{EMA_SHORT}"]
+        e50  = last[f"ema_{EMA_MID}"]
+        e200 = last[f"ema_{EMA_LONG}"]
+
+        if e21 > e50 > e200:
+            return "bullish"
+        elif e21 < e50 < e200:
+            return "bearish"
+        else:
+            return "ranging"
+
+    def _get_h4_trend_state(self, pair: str) -> str:
+        """
+        Reads current EMA 21/50/200 stack from H4 candles.
+        Returns "bullish" | "bearish" | "ranging".
+
+        Used as a second-timeframe confirmation for EUR/USD: both H1 and H4
+        stacks must agree. OOS PF improved 1.72 → 1.99 with this filter active.
+        """
+        df = self.md.get_dataframe(pair, granularity="H4", count=250)
+        if df.empty or len(df) < EMA_LONG:
+            print(f"  ⚠️  Insufficient H4 data — defaulting to ranging")
+            return "ranging"
+
+        df   = self.md.add_emas(df)
+        last = df.iloc[-1]
         e21  = last[f"ema_{EMA_SHORT}"]
         e50  = last[f"ema_{EMA_MID}"]
         e200 = last[f"ema_{EMA_LONG}"]
