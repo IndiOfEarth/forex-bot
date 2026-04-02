@@ -108,6 +108,54 @@ if __name__ == "__main__":
             **ALL_IMPROVEMENTS,
         ), df, "trend_all_lo")
 
+        # ── Phase B: Entry quality + exit filter configs ───────
+        # 9. First 30 min of London open only (07:00–07:30 UTC)
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            first_bar_minutes=30,
+        ), df, "first_bar_30m")
+
+        # 10. First 15 min only (07:00 bar only — strongest momentum)
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            first_bar_minutes=15,
+        ), df, "first_bar_15m")
+
+        # 11. Time-based exit at noon UTC (close before London lunchtime)
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            time_exit_hour=12,
+        ), df, "noon_exit")
+
+        # 12. 4H trend confirmation (H1 + H4 EMA stacks must agree)
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            require_4h_trend=True,
+            **ALL_IMPROVEMENTS,
+        ), df, "trend_h4")
+
+        # 13. ADX > 25 filter (trending market required at entry)
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            require_adx=True,
+            min_adx=25.0,
+            **ALL_IMPROVEMENTS,
+        ), df, "trend_adx")
+
+        # 14. Combined: first_bar + noon_exit + 4H + ADX (kitchen sink)
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            require_4h_trend=True,
+            require_adx=True,
+            min_adx=25.0,
+            first_bar_minutes=30,
+            time_exit_hour=12,
+            **ALL_IMPROVEMENTS,
+        ), df, "combined_filters")
+
     print("\n[Backtest] Done.\n")
     print("OOS aggregate comparison — check logs/ for per-trade CSVs.")
     print("Improvement targets vs baseline (trend_filter):")

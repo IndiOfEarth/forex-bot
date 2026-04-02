@@ -138,6 +138,31 @@ class StrategyParams:
     allowed_weekdays: tuple = ()
     excluded_months:  tuple = ()
 
+    # ── Entry timing filter ───────────────────────────────────
+    # first_bar_minutes: 0 = disabled; 15 or 30 = only accept entries fired
+    # within the first N minutes after 07:00 UTC. Bars at 07:00, 07:15, etc.
+    # first_bar_minutes=15 → only the 07:00 bar; =30 → 07:00 and 07:15 bars.
+    first_bar_minutes: int = 0
+
+    # ── Multi-timeframe trend confirmation ────────────────────
+    # require_4h_trend: when True, the H4 EMA 21/50/200 stack must agree
+    # with the H1 stack. H4 trend is derived by resampling the M15 data.
+    # Requires that both timeframes confirm the signal direction.
+    require_4h_trend: bool = False
+
+    # ── ADX trend strength filter ─────────────────────────────
+    # require_adx: when True, only trade when ADX >= min_adx (trending market).
+    # ADX < 20 = ranging; ADX > 25 = trending. Computed on M15 data using
+    # adx_period M15 bars (default 56 ≈ 14 H1 bars equivalent).
+    require_adx:  bool  = False
+    min_adx:      float = 25.0
+    adx_period:   int   = 56
+
+    # ── Time-based exit ───────────────────────────────────────
+    # time_exit_hour: 0 = disabled; 12 = force-close at noon UTC.
+    # Avoids afternoon lunchtime reversals on positions not yet at SL/TP.
+    time_exit_hour: int = 0
+
 
 # ── Main Engine ────────────────────────────────────────────────
 
@@ -198,7 +223,80 @@ class BacktestEngine:
             np.where(ema_sep_pips > 15, "trending", "ranging")
         )
 
+        # ADX (on M15 data; adx_period=56 ≈ 14 H1 bars)
+        df = self._compute_adx(df, period=p.adx_period)
+
         self.df = df
+
+        # H4 trend state — resample M15 → H4, compute EMA stack
+        df_h4 = self.df.resample("4h").agg({
+            "open":  "first",
+            "high":  "max",
+            "low":   "min",
+            "close": "last",
+        }).dropna()
+        df_h4[f"ema_{p.ema_short}"] = df_h4["close"].ewm(span=p.ema_short, adjust=False).mean()
+        df_h4[f"ema_{p.ema_mid}"]   = df_h4["close"].ewm(span=p.ema_mid,   adjust=False).mean()
+        df_h4[f"ema_{p.ema_long}"]  = df_h4["close"].ewm(span=p.ema_long,  adjust=False).mean()
+        h4_s = df_h4[f"ema_{p.ema_short}"]
+        h4_m = df_h4[f"ema_{p.ema_mid}"]
+        h4_l = df_h4[f"ema_{p.ema_long}"]
+        df_h4["h4_trend"] = np.where(
+            (h4_s > h4_m) & (h4_m > h4_l), "bullish",
+            np.where((h4_s < h4_m) & (h4_m < h4_l), "bearish", "ranging")
+        )
+        self.df_h4 = df_h4
+
+    # ── ADX Computation ────────────────────────────────────────
+
+    @staticmethod
+    def _compute_adx(df: pd.DataFrame, period: int = 56) -> pd.DataFrame:
+        """
+        Wilder ADX on any OHLC DataFrame.
+        Adds columns: adx, di_plus, di_minus.
+        """
+        high  = df["high"]
+        low   = df["low"]
+        close = df["close"]
+
+        prev_high  = high.shift(1)
+        prev_low   = low.shift(1)
+        prev_close = close.shift(1)
+
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low  - prev_close).abs(),
+        ], axis=1).max(axis=1)
+
+        move_up   = high - prev_high
+        move_down = prev_low - low
+
+        dm_plus  = pd.Series(
+            np.where((move_up > move_down) & (move_up > 0), move_up, 0.0),
+            index=df.index,
+        )
+        dm_minus = pd.Series(
+            np.where((move_down > move_up) & (move_down > 0), move_down, 0.0),
+            index=df.index,
+        )
+
+        alpha    = 1 / period
+        atr_w    = tr.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+        dip_smth = dm_plus.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+        dim_smth = dm_minus.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+
+        di_plus  = 100 * dip_smth / atr_w
+        di_minus = 100 * dim_smth / atr_w
+
+        denom = (di_plus + di_minus).replace(0, float("nan"))
+        dx    = 100 * (di_plus - di_minus).abs() / denom
+        adx   = dx.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+
+        df["adx"]      = adx.round(2)
+        df["di_plus"]  = di_plus.round(2)
+        df["di_minus"] = di_minus.round(2)
+        return df
 
     # ── Walk-Forward ───────────────────────────────────────────
 
@@ -344,13 +442,32 @@ class BacktestEngine:
         entry_trend  = None
 
         for ts, bar in london_bars.iterrows():
+            # First-bar filter: stop looking for entries after N minutes past 07:00
+            if p.first_bar_minutes > 0:
+                elapsed = ts.hour * 60 + ts.minute - self.LONDON_OPEN_HOUR * 60
+                if elapsed >= p.first_bar_minutes:
+                    break
+
             bar_trend = bar.get("trend_state", "ranging")
+
+            # ADX check — shared across both directions
+            if p.require_adx and bar.get("adx", 0) < p.min_adx:
+                continue
+
+            # H4 trend lookup — shared lookup, checked per-direction below
+            h4_trend = "ranging"
+            if p.require_4h_trend:
+                h4_before = self.df_h4[self.df_h4.index <= ts]
+                if not h4_before.empty:
+                    h4_trend = h4_before.iloc[-1]["h4_trend"]
 
             if bar["high"] >= long_entry and direction is None:
                 # Direction filter — skip if longs not allowed
                 if "buy" not in p.allowed_directions:
                     continue
                 if p.require_trend_alignment and bar_trend != "bullish":
+                    continue
+                if p.require_4h_trend and h4_trend != "bullish":
                     continue
                 # Momentum body ratio — require strong close on breakout bar
                 if p.require_body_ratio:
@@ -371,6 +488,8 @@ class BacktestEngine:
                 if "sell" not in p.allowed_directions:
                     continue
                 if p.require_trend_alignment and bar_trend != "bearish":
+                    continue
+                if p.require_4h_trend and h4_trend != "bearish":
                     continue
                 # Momentum body ratio — require strong close on breakout bar
                 if p.require_body_ratio:
@@ -439,6 +558,24 @@ class BacktestEngine:
         pnl_pips_blended = None   # set when partial close is involved
 
         for ts, bar in post_entry_bars.iterrows():
+            # Time-based exit: force-close at or after time_exit_hour UTC
+            if p.time_exit_hour > 0 and ts.hour >= p.time_exit_hour:
+                exit_price = bar["open"]
+                exit_time  = ts
+                if partial_closed:
+                    if direction == "buy":
+                        remaining = self._price_to_pips(exit_price - entry_price)
+                    else:
+                        remaining = self._price_to_pips(entry_price - exit_price)
+                    pnl_pips_blended = (p.partial_close_pct * partial_pnl_pips
+                                        + (1 - p.partial_close_pct) * remaining)
+                    outcome = "partial_win" if pnl_pips_blended > 0 else "breakeven"
+                else:
+                    raw = (self._price_to_pips(exit_price - entry_price) if direction == "buy"
+                           else self._price_to_pips(entry_price - exit_price))
+                    outcome = "win" if raw > 0 else ("loss" if raw < -self._pips_to_price(1) else "breakeven")
+                break
+
             if direction == "buy":
                 # 1. Update trailing stop to break-even
                 if trail_trigger_px and bar["high"] >= trail_trigger_px:
