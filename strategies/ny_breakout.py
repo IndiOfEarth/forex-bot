@@ -1,61 +1,38 @@
-from datetime import datetime, timezone, timedelta
-from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from oanda.client import OandaClient
 from oanda.market_data import MarketData
 from risk.manager import RiskManager
 from econ_calendar.filter import is_in_blackout
+from strategies.london_breakout import BreakoutSignal
 from config import (
     BREAKOUT_BUFFER_PIPS,
     MIN_REWARD_RISK,
     EMA_SHORT, EMA_MID, EMA_LONG,
-    BREAKOUT_ASIAN_MIN_PIPS,
     MOMENTUM_BODY_RATIO,
 )
 
 
-@dataclass
-class BreakoutSignal:
-    pair:             str
-    direction:        str        # "buy" | "sell"
-    entry_price:      float
-    stop_loss:        float
-    take_profit:      float
-    stop_pips:        float
-    target_pips:      float
-    rr_ratio:         float
-    asian_high:       float
-    asian_low:        float
-    asian_range_pips: float
-    trend_state:      str        # "bullish" | "bearish" | "ranging"
-    timestamp:        datetime
-
-
 # ── Per-pair configuration ─────────────────────────────────────
-# Derived directly from backtest results.
+# Conservative defaults until walk-forward backtest (configs 17–21 in
+# run_backtest.py) confirms optimal per-pair settings.
 # DO NOT change these without re-running the walk-forward backtest.
 #
-# EUR/USD: 4H trend confirmation (H1 + H4 EMA stack must agree).
-#          OOS PF improved 1.72 → 1.99, max DD halved.
-#          first_bar_minutes=0 — EUR breakouts can develop throughout 07–09 window.
+# European range window: 09:00–13:00 UTC
+# Entry window:          13:00–15:00 UTC (NY open / London–NY overlap)
 #
-# GBP/USD: first_bar_minutes=15 — only accept the 07:00 bar.
-#          Later bars are reversals, not extensions. OOS PF 1.27 → 1.71.
+# Tuning notes (update after backtest):
+#   - first_bar_minutes=15 means only the 13:00 bar fires (matching the
+#     London strategy's strongest-first-bar pattern).
+#   - require_4h_trend: to be assessed per-pair from backtest results.
+#   - allowed_weekdays=(0,1,2,3): same Friday exclusion as London strategy.
 #
-# USD/JPY: first_bar_minutes=15 — 07:00 bar dominates. PF 1.68 → 6.90 (14 OOS
-#          trades, spread across 11/15 windows). 30-min version: PF 2.65 (23 trades).
-#          Using 15m; watch closely in paper trading given small OOS sample.
-#
-# allowed_weekdays: Mon–Thu only (0–3). Friday win rate is 50–80% lower than
-#          Thu across all three pairs — OOS data confirms Friday exclusion
-#          improves effective PF ~10–15% with ~5% fewer trades.
-#
-PAIR_CONFIG = {
+NY_PAIR_CONFIG = {
     "EUR_USD": {
         "allowed_directions":      ("buy", "sell"),
         "require_trend_alignment": True,
-        "require_4h_trend":        True,
-        "first_bar_minutes":       0,
+        "require_4h_trend":        False,
+        "first_bar_minutes":       15,
         "allowed_weekdays":        (0, 1, 2, 3),
     },
     "GBP_USD": {
@@ -74,31 +51,39 @@ PAIR_CONFIG = {
     },
 }
 
+# ── European range window (UTC hours) ──────────────────────────
+EUROPEAN_RANGE_START = 9    # 09:00 UTC — London open momentum begins
+EUROPEAN_RANGE_END   = 13   # 13:00 UTC — NY open starts
 
-class LondonBreakout:
+# ── NY entry window (UTC hours) ────────────────────────────────
+NY_ENTRY_START = 13   # 13:00 UTC — NY session opens
+NY_ENTRY_END   = 15   # 15:00 UTC — early-NY momentum window closes
+
+
+class NYBreakout:
     """
-    London Breakout Strategy — backtest-validated configuration.
+    New York Open Breakout Strategy.
 
-    Per-pair settings applied from PAIR_CONFIG above.
-    Trend alignment and direction filters match the walk-forward
-    backtest results exactly.
+    Uses the European morning session (09:00–13:00 UTC) as the consolidation
+    range, then trades breakouts of that range when New York opens (13:00–15:00 UTC).
+    This is the highest-liquidity window of the day (London–NY overlap).
+
+    Filter pipeline mirrors the London Breakout strategy exactly — same
+    trend, timing, body ratio, and risk checks. Per-pair config (NY_PAIR_CONFIG)
+    is to be tuned from walk-forward backtest results.
 
     Logic:
-      1. Build Asian session range (22:00 prev day – 07:00 UTC)
-      2. At London open (07:00–09:00 UTC):
-             long entry  = asian_high + buffer_pips
-             short entry = asian_low  - buffer_pips
+      1. Build European morning range (09:00–13:00 UTC)
+      2. At NY open (13:00–15:00 UTC):
+             long entry  = european_high + buffer_pips
+             short entry = european_low  - buffer_pips
       3. Signal fires when live price crosses either level
-      4. Trend filter: EMA 21/50/200 must be stacked in signal direction
-      5. Direction filter: pair-specific — GBP/USD long only
-      6. Stop: opposite side of Asian range + buffer
-      7. Take profit: entry + (stop_distance * 2.5R)
+      4. Same trend, body ratio, weekday, news, and risk filters as London strategy
     """
 
-    MIN_RANGE_PIPS   = BREAKOUT_ASIAN_MIN_PIPS
-    MAX_RANGE_PIPS   = 80
-    REWARD_RISK      = 2.5
-    LONDON_OPEN_HOUR = 7
+    MIN_RANGE_PIPS = 20
+    MAX_RANGE_PIPS = 80
+    REWARD_RISK    = 2.5
 
     def __init__(
         self,
@@ -110,30 +95,30 @@ class LondonBreakout:
         self.client = client
         self.md     = market_data
         self.risk   = risk_manager
-        self.pairs  = pairs or ["EUR_USD", "GBP_USD"]
+        self.pairs  = pairs or ["EUR_USD", "GBP_USD", "USD_JPY"]
         self._fired_today: set[str] = set()
 
     # ── Main Entry Point ───────────────────────────────────────
 
     def scan(self, events: list[dict], bias: dict = None, open_trades: list[dict] = None) -> list[BreakoutSignal]:
         """
-        Scans all configured pairs for London breakout signals.
-        Call this at or after 07:00 UTC, before 09:00 UTC.
+        Scans all configured pairs for NY open breakout signals.
+        Call this at or after 13:00 UTC, before 15:00 UTC.
         """
         now     = datetime.now(timezone.utc)
         signals = []
 
-        if not self._in_breakout_window(now):
-            print(f"[LondonBreakout] Outside window (07:00–09:00 UTC). "
+        if not self._in_entry_window(now):
+            print(f"[NYBreakout] Outside window (13:00–15:00 UTC). "
                   f"Current: {now.strftime('%H:%M')} UTC")
             return signals
 
         for pair in self.pairs:
             if pair in self._fired_today:
-                print(f"[LondonBreakout] {pair} — already fired today.")
+                print(f"[NYBreakout] {pair} — already fired today.")
                 continue
 
-            print(f"\n[LondonBreakout] Scanning {pair}...")
+            print(f"\n[NYBreakout] Scanning {pair}...")
             signal = self._evaluate_pair(pair, events, bias, now, open_trades)
 
             if signal:
@@ -153,18 +138,17 @@ class LondonBreakout:
         open_trades: list[dict] = None,
     ) -> BreakoutSignal | None:
 
-        # Load per-pair config — fall back to most conservative defaults
-        cfg = PAIR_CONFIG.get(pair, {
+        cfg = NY_PAIR_CONFIG.get(pair, {
             "allowed_directions":      ("buy", "sell"),
             "require_trend_alignment": True,
             "require_4h_trend":        False,
-            "first_bar_minutes":       0,
-            "allowed_weekdays":        (),
+            "first_bar_minutes":       15,
+            "allowed_weekdays":        (0, 1, 2, 3),
         })
         allowed_directions      = cfg["allowed_directions"]
         require_trend_alignment = cfg["require_trend_alignment"]
         require_4h_trend        = cfg.get("require_4h_trend", False)
-        first_bar_minutes       = cfg.get("first_bar_minutes", 0)
+        first_bar_minutes       = cfg.get("first_bar_minutes", 15)
         allowed_weekdays        = cfg.get("allowed_weekdays", ())
 
         # 0. Weekday filter — before any API calls (Mon=0, Fri=4)
@@ -175,10 +159,10 @@ class LondonBreakout:
 
         # 1. First-bar filter — before any API calls
         if first_bar_minutes > 0:
-            minutes_past_open = now.hour * 60 + now.minute - self.LONDON_OPEN_HOUR * 60
+            minutes_past_open = now.hour * 60 + now.minute - NY_ENTRY_START * 60
             if minutes_past_open >= first_bar_minutes:
                 print(f"  ❌ Outside first-bar window "
-                      f"({minutes_past_open}min past open, limit {first_bar_minutes}min)")
+                      f"({minutes_past_open}min past NY open, limit {first_bar_minutes}min)")
                 return None
 
         # 2. News blackout
@@ -187,127 +171,103 @@ class LondonBreakout:
             print(f"  ❌ Blocked — {reason}")
             return None
 
-        # 3. Asian session range
-        asian = self.md.get_asian_range(pair)
-        if not asian:
-            print(f"  ❌ Asian range unavailable.")
+        # 3. European range
+        european = self.md.get_session_range(pair, EUROPEAN_RANGE_START, EUROPEAN_RANGE_END)
+        if european is None:
+            print(f"  ❌ No European range data")
             return None
 
-        range_pips = asian["range_pips"]
-
-        # 3. Range size filter
+        # 4. Range size: minimum
+        range_pips = european["range_pips"]
         if range_pips < self.MIN_RANGE_PIPS:
-            print(f"  ❌ Range too narrow: {range_pips} pips (min {self.MIN_RANGE_PIPS})")
+            print(f"  ❌ Range too small: {range_pips:.1f} pips (min {self.MIN_RANGE_PIPS})")
             return None
+
+        # 5. Range size: maximum
         if range_pips > self.MAX_RANGE_PIPS:
-            print(f"  ❌ Range too wide: {range_pips} pips (max {self.MAX_RANGE_PIPS})")
+            print(f"  ❌ Range too large: {range_pips:.1f} pips (max {self.MAX_RANGE_PIPS})")
             return None
 
-        print(f"  ✓ Asian range: {asian['low']:.5f} – {asian['high']:.5f} ({range_pips} pips)")
-
-        # 4. Current price
+        # 6. Current price
         price_data = self.client.get_price(pair)
-        if not price_data["tradeable"]:
-            print(f"  ❌ Pair not tradeable.")
+        if not price_data or not price_data.get("tradeable"):
+            print(f"  ❌ Price not available for {pair}")
             return None
 
-        bid = price_data["bid"]
         ask = price_data["ask"]
-        mid = (bid + ask) / 2
+        bid = price_data["bid"]
 
-        # 5. Breakout levels
-        pip_size    = self.md.pips_to_price(BREAKOUT_BUFFER_PIPS, pair)
-        long_entry  = asian["high"] + pip_size
-        short_entry = asian["low"]  - pip_size
+        # 7. Breakout levels
+        pip           = self.md.pips_to_price(BREAKOUT_BUFFER_PIPS, pair)
+        long_entry    = european["high"] + pip
+        short_entry   = european["low"]  - pip
 
-        print(f"  Long entry  : {long_entry:.5f}  (asian high + {BREAKOUT_BUFFER_PIPS} pips)")
-        print(f"  Short entry : {short_entry:.5f}  (asian low  - {BREAKOUT_BUFFER_PIPS} pips)")
-        print(f"  Current mid : {mid:.5f}")
-
-        # 6. Trend state — H1 EMA stack
+        # 8. H1 Trend state
         trend_state = self._get_trend_state(pair)
-        print(f"  H1 trend    : {trend_state.upper()}")
 
-        # 7. 4H trend confirmation (EUR/USD only — per PAIR_CONFIG)
+        # 9. H4 trend (optional, per-pair)
+        h4_trend = "ranging"
         if require_4h_trend:
             h4_trend = self._get_h4_trend_state(pair)
-            print(f"  H4 trend    : {h4_trend.upper()}")
-        else:
-            h4_trend = None
 
-        # 8. Detect breakout direction, apply direction + trend filters
+        # 10. Breakout detection + filters
         direction   = None
         entry_price = None
 
-        if ask >= long_entry:
-            if "buy" not in allowed_directions:
-                print(f"  ❌ Long breakout blocked — direction config: {allowed_directions}")
-                return None
+        if ask >= long_entry and "buy" in allowed_directions:
             if require_trend_alignment and trend_state != "bullish":
-                print(f"  ❌ Long breakout blocked — H1 trend not bullish ({trend_state})")
+                print(f"  ❌ Long signal blocked — H1 trend is {trend_state}")
                 return None
             if require_4h_trend and h4_trend != "bullish":
-                print(f"  ❌ Long breakout blocked — H4 trend not bullish ({h4_trend})")
+                print(f"  ❌ Long signal blocked — H4 trend is {h4_trend}")
                 return None
             direction   = "buy"
             entry_price = ask
 
-        elif bid <= short_entry:
-            if "sell" not in allowed_directions:
-                print(f"  ❌ Short breakout blocked — direction config: {allowed_directions}")
-                return None
+        elif bid <= short_entry and "sell" in allowed_directions:
             if require_trend_alignment and trend_state != "bearish":
-                print(f"  ❌ Short breakout blocked — H1 trend not bearish ({trend_state})")
+                print(f"  ❌ Short signal blocked — H1 trend is {trend_state}")
                 return None
             if require_4h_trend and h4_trend != "bearish":
-                print(f"  ❌ Short breakout blocked — H4 trend not bearish ({h4_trend})")
+                print(f"  ❌ Short signal blocked — H4 trend is {h4_trend}")
                 return None
             direction   = "sell"
             entry_price = bid
 
-        if not direction:
-            print(f"  — No breakout yet.")
+        if direction is None:
+            print(f"  — No breakout: ask={ask:.5f}, bid={bid:.5f}, "
+                  f"long={long_entry:.5f}, short={short_entry:.5f}")
             return None
 
-        # 8. Momentum body ratio — reject wick breakouts
-        #
-        # The most recently CLOSED M15 bar is the bar that caused the breakout.
-        # If that bar's body (|close - open|) is less than 60% of its full range
-        # (high - low), the breakout was driven by a wick rather than a strong
-        # directional close.  Wick breakouts reverse far more often — the price
-        # briefly spiked through the level but the bar closed back near the middle,
-        # showing no real conviction.  The backtest showed filtering these out
-        # improves GBP/USD OOS pips by ~100 and EUR/USD PF from 1.31 to 1.72.
-        m15_df = self.md.get_dataframe(pair, granularity="M15", count=3)
-        if not m15_df.empty:
-            last_bar  = m15_df.iloc[-1]
+        # 11. Momentum body ratio — fetch M15 candles, check last closed bar
+        m15 = self.md.get_dataframe(pair, granularity="M15", count=5)
+        if not m15.empty:
+            last_bar = m15.iloc[-2]   # second-to-last = last closed bar
             bar_range = last_bar["high"] - last_bar["low"]
             bar_body  = abs(last_bar["close"] - last_bar["open"])
             body_ratio = bar_body / bar_range if bar_range > 0 else 0
-            print(f"  Body ratio  : {body_ratio:.2f} (min {MOMENTUM_BODY_RATIO})")
             if body_ratio < MOMENTUM_BODY_RATIO:
-                print(f"  ❌ Wick breakout — body ratio too low ({body_ratio:.2f})")
+                print(f"  ❌ Weak breakout bar: body ratio {body_ratio:.2f} "
+                      f"(min {MOMENTUM_BODY_RATIO})")
                 return None
 
-        # 9. Bias filter — weekly macro suppression
-        if bias:
-            suppressed = self._bias_suppresses(direction, pair, bias)
-            if suppressed:
-                print(f"  ❌ Suppressed by weekly bias ({bias['bias']})")
-                return None
+        # 12. Weekly macro bias suppression
+        if bias and self._bias_suppresses(direction, pair, bias):
+            print(f"  ❌ Suppressed by weekly bias ({bias['bias']})")
+            return None
 
-        # 10. Calculate levels
+        # 13. Calculate levels
         stop_loss, take_profit, stop_pips, target_pips = self._calculate_levels(
-            direction, entry_price, asian, pair
+            direction, entry_price, european, pair
         )
 
-        # 11. RR check
+        # 14. RR check
         rr = target_pips / stop_pips if stop_pips > 0 else 0
         if rr < MIN_REWARD_RISK:
             print(f"  ❌ RR too low: {rr:.2f}")
             return None
 
-        # 12. Pre-trade risk check
+        # 15. Pre-trade risk check
         ok, _ = self.risk.pre_trade_check(
             pair=pair,
             direction=direction,
@@ -327,8 +287,8 @@ class LondonBreakout:
             stop_pips=stop_pips,
             target_pips=target_pips,
             rr_ratio=round(rr, 2),
-            asian_high=asian["high"],
-            asian_low=asian["low"],
+            asian_high=european["high"],
+            asian_low=european["low"],
             asian_range_pips=range_pips,
             trend_state=trend_state,
             timestamp=now,
@@ -337,25 +297,13 @@ class LondonBreakout:
     # ── Trend State ────────────────────────────────────────────
 
     def _get_trend_state(self, pair: str) -> str:
-        """
-        Reads current EMA 21/50/200 stack from H1 candles.
-        Returns "bullish" | "bearish" | "ranging".
-
-        bullish = 21 > 50 > 200  (all pointing up, aligned)
-        bearish = 21 < 50 < 200  (all pointing down, aligned)
-        ranging = anything else  (mixed — no clean trend)
-
-        Uses H1 to match the backtest granularity for indicator
-        calculation. Requires 250 candles for EMA 200 to be valid.
-        """
         df = self.md.get_dataframe(pair, granularity="H1", count=250)
         if df.empty or len(df) < EMA_LONG:
             print(f"  ⚠️  Insufficient data for trend state — defaulting to ranging")
             return "ranging"
 
-        df = self.md.add_emas(df)
+        df   = self.md.add_emas(df)
         last = df.iloc[-1]
-
         e21  = last[f"ema_{EMA_SHORT}"]
         e50  = last[f"ema_{EMA_MID}"]
         e200 = last[f"ema_{EMA_LONG}"]
@@ -368,13 +316,6 @@ class LondonBreakout:
             return "ranging"
 
     def _get_h4_trend_state(self, pair: str) -> str:
-        """
-        Reads current EMA 21/50/200 stack from H4 candles.
-        Returns "bullish" | "bearish" | "ranging".
-
-        Used as a second-timeframe confirmation for EUR/USD: both H1 and H4
-        stacks must agree. OOS PF improved 1.72 → 1.99 with this filter active.
-        """
         df = self.md.get_dataframe(pair, granularity="H4", count=250)
         if df.empty or len(df) < EMA_LONG:
             print(f"  ⚠️  Insufficient H4 data — defaulting to ranging")
@@ -397,18 +338,18 @@ class LondonBreakout:
 
     def _calculate_levels(
         self,
-        direction:   str,
-        entry:       float,
-        asian:       dict,
-        pair:        str,
+        direction: str,
+        entry:     float,
+        european:  dict,
+        pair:      str,
     ) -> tuple[float, float, float, float]:
         pip = self.md.pips_to_price(BREAKOUT_BUFFER_PIPS, pair)
 
         if direction == "buy":
-            stop_loss   = asian["low"] - pip
+            stop_loss   = european["low"] - pip
             take_profit = entry + (entry - stop_loss) * self.REWARD_RISK
         else:
-            stop_loss   = asian["high"] + pip
+            stop_loss   = european["high"] + pip
             take_profit = entry - (stop_loss - entry) * self.REWARD_RISK
 
         stop_pips   = self.md.price_to_pips(abs(entry - stop_loss), pair)
@@ -439,12 +380,12 @@ class LondonBreakout:
 
     # ── Helpers ────────────────────────────────────────────────
 
-    def _in_breakout_window(self, now: datetime) -> bool:
-        return 7 <= now.hour < 9
+    def _in_entry_window(self, now: datetime) -> bool:
+        return NY_ENTRY_START <= now.hour < NY_ENTRY_END
 
     def reset_daily(self):
         self._fired_today.clear()
-        print("[LondonBreakout] Daily state reset.")
+        print("[NYBreakout] Daily state reset.")
 
     def mark_fired(self, pair: str):
         self._fired_today.add(pair)
@@ -452,13 +393,13 @@ class LondonBreakout:
     def _print_signal(self, s: BreakoutSignal):
         arrow = "▲ BUY" if s.direction == "buy" else "▼ SELL"
         print(f"\n  {'='*50}")
-        print(f"  🚨 SIGNAL — {s.pair}  {arrow}")
+        print(f"  🚨 NY SIGNAL — {s.pair}  {arrow}")
         print(f"  {'='*50}")
-        print(f"  Entry       : {s.entry_price:.5f}")
-        print(f"  Stop Loss   : {s.stop_loss:.5f}  ({s.stop_pips:.1f} pips)")
-        print(f"  Take Profit : {s.take_profit:.5f}  ({s.target_pips:.1f} pips)")
-        print(f"  RR Ratio    : 1:{s.rr_ratio}")
-        print(f"  Trend       : {s.trend_state.upper()}")
-        print(f"  Asian Range : {s.asian_low:.5f} – {s.asian_high:.5f}  ({s.asian_range_pips} pips)")
-        print(f"  Time        : {s.timestamp.strftime('%H:%M UTC')}")
+        print(f"  Entry          : {s.entry_price:.5f}")
+        print(f"  Stop Loss      : {s.stop_loss:.5f}  ({s.stop_pips:.1f} pips)")
+        print(f"  Take Profit    : {s.take_profit:.5f}  ({s.target_pips:.1f} pips)")
+        print(f"  RR Ratio       : 1:{s.rr_ratio}")
+        print(f"  Trend          : {s.trend_state.upper()}")
+        print(f"  European Range : {s.asian_low:.5f} – {s.asian_high:.5f}  ({s.asian_range_pips} pips)")
+        print(f"  Time           : {s.timestamp.strftime('%H:%M UTC')}")
         print(f"  {'='*50}\n")

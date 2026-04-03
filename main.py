@@ -6,11 +6,12 @@ from datetime import datetime, timezone, timedelta
 
 from oanda.client import OandaClient
 from oanda.market_data import MarketData
-from oanda.orders import OrderExecutor
+from oanda.orders import OrderExecutor, _append_trade_csv
 from econ_calendar.fetcher import fetch_weekly_events, get_todays_events
 from econ_calendar.filter import is_in_blackout, calculate_weekly_bias, print_weekly_bias, minutes_to_next_event
 from risk.manager import RiskManager
 from strategies.london_breakout import LondonBreakout
+from strategies.ny_breakout import NYBreakout
 from config import PAIRS, PRIMARY_PAIR, LOG_DIR
 
 # ── DRY RUN FLAG ───────────────────────────────────────────────
@@ -56,7 +57,7 @@ def setup_logging():
 
 # ── Single trading cycle ────────────────────────────────────────
 
-def run_cycle(client, risk, executor, breakout, dry_run: bool):
+def run_cycle(client, risk, executor, breakout, dry_run: bool, ny_breakout=None):
     """Runs one full scan-and-execute cycle."""
     now = datetime.now(timezone.utc)
     print(f"\n{'─'*60}")
@@ -92,11 +93,12 @@ def run_cycle(client, risk, executor, breakout, dry_run: bool):
     risk.print_risk_status()
 
     # ── London Breakout Scan ──────────────────────────────────
+    executor_obj = executor
+    open_trades = executor_obj.get_open_trades()
     print("[London Breakout] Running scan...\n")
-    signals = breakout.scan(events=todays_events, bias=bias)
+    signals = breakout.scan(events=todays_events, bias=bias, open_trades=open_trades)
 
     # ── Execution ─────────────────────────────────────────────
-    executor_obj = executor
     if signals:
         print(f"\n[Executor] {len(signals)} signal(s) ready.")
         for signal in signals:
@@ -116,6 +118,18 @@ def run_cycle(client, risk, executor, breakout, dry_run: bool):
                 print(f"  Stop Loss   : {signal.stop_loss:.5f}")
                 print(f"  Take Profit : {signal.take_profit:.5f}")
                 print(f"  RR          : 1:{signal.rr_ratio}")
+                _append_trade_csv({
+                    "timestamp":   datetime.now(timezone.utc).isoformat(),
+                    "pair":        signal.pair,
+                    "direction":   signal.direction,
+                    "entry":       signal.entry_price,
+                    "stop_loss":   signal.stop_loss,
+                    "take_profit": signal.take_profit,
+                    "units":       units,
+                    "rr_ratio":    signal.rr_ratio,
+                    "scalar":      scalar,
+                    "mode":        "dry_run",
+                })
             else:
                 scalar = 0.5 if bias.get("is_fomc_week") else 1.0
                 executor_obj.execute_signal(signal, scalar=scalar, label="london_breakout")
@@ -123,12 +137,51 @@ def run_cycle(client, risk, executor, breakout, dry_run: bool):
     else:
         print(f"\n[Executor] No signals to execute.")
 
+    # ── NY Open Breakout Scan ─────────────────────────────────
+    if ny_breakout:
+        ny_signals = ny_breakout.scan(events=todays_events, bias=bias, open_trades=open_trades)
+        if ny_signals:
+            print(f"\n[NY Executor] {len(ny_signals)} signal(s) ready.")
+            for signal in ny_signals:
+                scalar = 0.5 if bias.get("is_fomc_week") else 1.0
+                if dry_run:
+                    units = risk.calculate_units(
+                        pair=signal.pair,
+                        direction=signal.direction,
+                        stop_pips=signal.stop_pips,
+                        scalar=scalar,
+                    )
+                    print(f"\n[DRY RUN] Would place:")
+                    print(f"  Pair        : {signal.pair}")
+                    print(f"  Direction   : {signal.direction.upper()}")
+                    print(f"  Units       : {units:+,}")
+                    print(f"  Entry       : {signal.entry_price:.5f}")
+                    print(f"  Stop Loss   : {signal.stop_loss:.5f}")
+                    print(f"  Take Profit : {signal.take_profit:.5f}")
+                    print(f"  RR          : 1:{signal.rr_ratio}")
+                    _append_trade_csv({
+                        "timestamp":   datetime.now(timezone.utc).isoformat(),
+                        "pair":        signal.pair,
+                        "direction":   signal.direction,
+                        "entry":       signal.entry_price,
+                        "stop_loss":   signal.stop_loss,
+                        "take_profit": signal.take_profit,
+                        "units":       units,
+                        "rr_ratio":    signal.rr_ratio,
+                        "scalar":      scalar,
+                        "mode":        "dry_run",
+                    })
+                else:
+                    executor_obj.execute_signal(signal, scalar=scalar, label="ny_breakout")
+                    ny_breakout.mark_fired(signal.pair)
+        else:
+            print(f"\n[NY Executor] No signals to execute.")
+
     # ── Open Trades ───────────────────────────────────────────
     executor_obj.print_open_trades()
 
     # ── Trailing Stop Management ──────────────────────────────
     if not dry_run:
-        open_trades = executor_obj.get_open_trades()
         managed = 0
         for trade in open_trades:
             comment  = trade.get("clientExtensions", {}).get("comment", "")
@@ -157,16 +210,20 @@ def run_cycle(client, risk, executor, breakout, dry_run: bool):
 # ── Scheduler helpers ───────────────────────────────────────────
 
 def _next_window_start(now: datetime) -> datetime:
-    """Returns the next 06:45 UTC on or after now."""
-    target = now.replace(hour=6, minute=45, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return target
+    """Returns the next scan window start (06:45 or 12:45 UTC) strictly after now."""
+    today_london = now.replace(hour=6,  minute=45, second=0, microsecond=0)
+    today_ny     = now.replace(hour=12, minute=45, second=0, microsecond=0)
+    candidates   = [t for t in [today_london, today_ny] if t > now]
+    if candidates:
+        return min(candidates)
+    return today_london + timedelta(days=1)
 
 
 def _in_scan_window(now: datetime) -> bool:
-    """True during 06:45–09:00 UTC."""
-    return (now.hour == 6 and now.minute >= 45) or (now.hour == 7) or (now.hour == 8)
+    """True during 06:45–09:00 UTC (London) or 12:45–15:00 UTC (NY)."""
+    london = (now.hour == 6 and now.minute >= 45) or (now.hour == 7) or (now.hour == 8)
+    ny     = (now.hour == 12 and now.minute >= 45) or (now.hour == 13) or (now.hour == 14)
+    return london or ny
 
 
 def _seconds_until(target: datetime, now: datetime) -> float:
@@ -186,16 +243,20 @@ def main_once(dry_run: bool):
         print("[Forex Bot] Aborting — fix connection before proceeding.")
         return
 
-    md       = MarketData(client)
-    risk     = RiskManager(client)
-    executor = OrderExecutor(client=client, market_data=md, risk=risk)
-    breakout = LondonBreakout(
+    md          = MarketData(client)
+    risk        = RiskManager(client)
+    executor    = OrderExecutor(client=client, market_data=md, risk=risk)
+    breakout    = LondonBreakout(
+        client=client, market_data=md, risk_manager=risk,
+        pairs=["EUR_USD", "GBP_USD", "USD_JPY"],
+    )
+    ny_breakout = NYBreakout(
         client=client, market_data=md, risk_manager=risk,
         pairs=["EUR_USD", "GBP_USD", "USD_JPY"],
     )
 
     md.print_snapshot(PRIMARY_PAIR)
-    run_cycle(client, risk, executor, breakout, dry_run)
+    run_cycle(client, risk, executor, breakout, dry_run, ny_breakout=ny_breakout)
     print("\n[Forex Bot] Done. ✓")
 
 
@@ -216,10 +277,14 @@ def main_loop(dry_run: bool):
         print("[Forex Bot] Aborting — fix connection before proceeding.")
         return
 
-    md       = MarketData(client)
-    risk     = RiskManager(client)
-    executor = OrderExecutor(client=client, market_data=md, risk=risk)
-    breakout = LondonBreakout(
+    md          = MarketData(client)
+    risk        = RiskManager(client)
+    executor    = OrderExecutor(client=client, market_data=md, risk=risk)
+    breakout    = LondonBreakout(
+        client=client, market_data=md, risk_manager=risk,
+        pairs=["EUR_USD", "GBP_USD", "USD_JPY"],
+    )
+    ny_breakout = NYBreakout(
         client=client, market_data=md, risk_manager=risk,
         pairs=["EUR_USD", "GBP_USD", "USD_JPY"],
     )
@@ -233,6 +298,7 @@ def main_loop(dry_run: bool):
         today = now.date()
         if last_reset_date != today:
             breakout.reset_daily()
+            ny_breakout.reset_daily()
             # Rotate log file at midnight
             setup_logging()
             last_reset_date = today
@@ -248,7 +314,7 @@ def main_loop(dry_run: bool):
             continue
 
         # ── Inside scan window: run cycle ──────────────────────
-        run_cycle(client, risk, executor, breakout, dry_run)
+        run_cycle(client, risk, executor, breakout, dry_run, ny_breakout=ny_breakout)
 
         # Sleep until next scan, or exit window
         now = datetime.now(timezone.utc)

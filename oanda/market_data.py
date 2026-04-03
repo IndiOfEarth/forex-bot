@@ -135,6 +135,47 @@ class MarketData:
             "session_end":   session_end,
         }
 
+    def get_session_range(self, pair: str, start_hour: int, end_hour: int) -> dict | None:
+        """
+        Calculates the high/low range for a same-day UTC hour window.
+        All bars must fall within [start_hour, end_hour) on the current day.
+
+        Used by NY Breakout: call with start_hour=9, end_hour=13 to get the
+        European morning consolidation range (post-London-open).
+
+        Returns the same dict shape as get_asian_range().
+        """
+        now = datetime.now(timezone.utc)
+        session_end   = now.replace(hour=end_hour,   minute=0, second=0, microsecond=0)
+        session_start = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+
+        if now < session_end:
+            print(f"[MarketData] Session {start_hour:02d}:00–{end_hour:02d}:00 UTC not yet closed.")
+            return None
+
+        bars_needed = int((end_hour - start_hour) * 4) + 5   # 4 M15 bars/hr + buffer
+        df = self.get_dataframe(pair, granularity="M15", count=bars_needed)
+        if df.empty:
+            return None
+
+        session_df = df[(df.index >= session_start) & (df.index < session_end)]
+        if session_df.empty:
+            print(f"[MarketData] No candles found for {pair} in {start_hour:02d}:00–{end_hour:02d}:00 UTC")
+            return None
+
+        high = session_df["high"].max()
+        low  = session_df["low"].min()
+        pip_divisor = 0.01 if "JPY" in pair else 0.0001
+        range_pips  = round((high - low) / pip_divisor, 1)
+
+        return {
+            "high":          high,
+            "low":           low,
+            "range_pips":    range_pips,
+            "session_start": session_start,
+            "session_end":   session_end,
+        }
+
     # ── Pip Utilities ──────────────────────────────────────────
 
     @staticmethod

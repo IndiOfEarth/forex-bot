@@ -10,9 +10,14 @@ Configs per pair:
   6.  trend_trailing_lo       — config 5 + long only
   7.  trend_all               — config 5 + min range 20 pips + body ratio filter
   8.  trend_all_lo            — config 7 + long only
-
-Configs 5–8 implement Phase 1+2 improvements. Compare OOS pips vs configs 2–4
-to decide which to activate in the live strategy.
+  9.  first_bar_30m           — trend_all + first 30 min of London open only
+  10. first_bar_15m           — trend_all + first 15 min only (07:00 bar)
+  11. noon_exit               — trend_all + force-close at noon UTC
+  12. trend_h4                — trend_all + H4 trend confirmation
+  13. trend_adx               — trend_all + ADX >= 25
+  14. combined_filters        — first_bar_30m + noon_exit + 4H + ADX
+  15. no_friday               — deployed live config + Friday excluded (Mon–Thu only)
+  16. no_friday_4h            — EUR/USD deployed config (trend_h4) + Friday excluded
 """
 
 import sys, os
@@ -54,10 +59,22 @@ ALL_IMPROVEMENTS = dict(
 )
 
 
+MON_THU = (0, 1, 2, 3)   # Mon=0 … Thu=3; excludes Friday (4)
+
+# ── NY Open window params ──────────────────────────────────────
+# European range: 09:00–13:00 UTC (post-London-open consolidation)
+# Entry window:   13:00–15:00 UTC (NY open / London–NY overlap)
+NY_WINDOW = dict(
+    range_start_hour=9,
+    range_end_hour=13,
+    entry_start_hour=13,
+    entry_end_hour=15,
+)
+
 if __name__ == "__main__":
     client = OandaClient()
 
-    for pair in ["EUR_USD", "GBP_USD", "USD_JPY", "USD_CAD"]:
+    for pair in ["EUR_USD", "GBP_USD", "USD_JPY", "USD_CAD", "AUD_USD", "EUR_JPY"]:
         df = fetch_historical(client, pair=pair, granularity="M15", years=3)
         if df.empty:
             continue
@@ -156,6 +173,59 @@ if __name__ == "__main__":
             **ALL_IMPROVEMENTS,
         ), df, "combined_filters")
 
+        # ── Phase D: Friday exclusion ──────────────────────────
+        # 15. Deployed live config (first_bar_15m) + Mon–Thu only
+        #     Compare OOS PF vs config 10 (first_bar_15m) to quantify Friday impact.
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            first_bar_minutes=15,
+            allowed_weekdays=MON_THU,
+        ), df, "no_friday")
+
+        # 16. EUR/USD deployed config (trend_h4) + Mon–Thu only
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            require_4h_trend=True,
+            **ALL_IMPROVEMENTS,
+            allowed_weekdays=MON_THU,
+        ), df, "no_friday_4h")
+
+        # ── Phase E: NY Open Breakout configs ─────────────────
+        # 17. NY base — European range (09–13 UTC) + NY entry (13–15 UTC), no filters
+        run(pair, StrategyParams(
+            **NY_WINDOW,
+        ), df, "ny_base")
+
+        # 18. NY trend — EMA alignment filter
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **NY_WINDOW,
+        ), df, "ny_trend")
+
+        # 19. NY quality — trend + range + body ratio + trailing/partial exit
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            **NY_WINDOW,
+        ), df, "ny_quality")
+
+        # 20. NY first-bar 15m — only the 13:00 bar (strongest NY open momentum)
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            first_bar_minutes=15,
+            **NY_WINDOW,
+        ), df, "ny_first15m")
+
+        # 21. NY quality + Mon–Thu only
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            allowed_weekdays=MON_THU,
+            **NY_WINDOW,
+        ), df, "ny_no_friday")
+
     print("\n[Backtest] Done.\n")
     print("OOS aggregate comparison — check logs/ for per-trade CSVs.")
     print("Improvement targets vs baseline (trend_filter):")
@@ -163,3 +233,5 @@ if __name__ == "__main__":
     print("  GBP_USD: PF > 1.25, OOS pips > +460")
     print("  USD_JPY: acceptance gate — OOS PF > 1.2 and > 30 OOS trades")
     print("  USD_CAD: acceptance gate — OOS PF > 1.2 and > 30 OOS trades")
+    print("  AUD_USD: acceptance gate — OOS PF > 1.5 and > 30 OOS trades")
+    print("  EUR_JPY: acceptance gate — OOS PF > 1.5 and > 30 OOS trades")

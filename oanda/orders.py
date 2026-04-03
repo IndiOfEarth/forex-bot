@@ -1,3 +1,7 @@
+import csv
+import os
+from datetime import datetime, timezone
+
 import oandapyV20.endpoints.orders as orders
 import oandapyV20.endpoints.trades as trades
 import oandapyV20.endpoints.positions as positions
@@ -6,7 +10,23 @@ from oanda.client import OandaClient
 from oanda.market_data import MarketData
 from risk.manager import RiskManager
 from strategies.london_breakout import BreakoutSignal
-from config import OANDA_ACCOUNT_ID, TRAIL_TRIGGER_R, TRAIL_LOCK_R, PARTIAL_CLOSE_R, PARTIAL_CLOSE_PCT
+from config import OANDA_ACCOUNT_ID, TRAIL_TRIGGER_R, TRAIL_LOCK_R, PARTIAL_CLOSE_R, PARTIAL_CLOSE_PCT, TRADE_LOG_FILE
+
+_TRADE_CSV_FIELDS = [
+    "timestamp", "pair", "direction", "entry", "stop_loss",
+    "take_profit", "units", "rr_ratio", "scalar", "mode",
+]
+
+
+def _append_trade_csv(row: dict) -> None:
+    """Appends one entry row to TRADE_LOG_FILE. Creates the file with a header if needed."""
+    os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True)
+    file_exists = os.path.isfile(TRADE_LOG_FILE)
+    with open(TRADE_LOG_FILE, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_TRADE_CSV_FIELDS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 class OrderExecutor:
@@ -94,11 +114,13 @@ class OrderExecutor:
         scalar: position size multiplier from weekly bias engine.
         """
         # Final pre-trade check before touching the market
+        open_trades = self.get_open_trades()
         ok, _ = self.risk.pre_trade_check(
             pair=signal.pair,
             direction=signal.direction,
             stop_pips=signal.stop_pips,
             target_pips=signal.target_pips,
+            open_trades=open_trades,
         )
         if not ok:
             print(f"[Orders] Pre-trade check failed — order cancelled.")
@@ -116,7 +138,7 @@ class OrderExecutor:
             print(f"[Orders] Unit calculation returned 0 — order cancelled.")
             return None
 
-        return self.place_market_order(
+        result = self.place_market_order(
             pair=signal.pair,
             units=units,
             stop_loss=signal.stop_loss,
@@ -124,6 +146,20 @@ class OrderExecutor:
             label=label,
             initial_sl=signal.stop_loss,
         )
+        if result:
+            _append_trade_csv({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "pair":      signal.pair,
+                "direction": signal.direction,
+                "entry":     signal.entry_price,
+                "stop_loss": signal.stop_loss,
+                "take_profit": signal.take_profit,
+                "units":     units,
+                "rr_ratio":  signal.rr_ratio,
+                "scalar":    scalar,
+                "mode":      "live",
+            })
+        return result
 
     # ── Trade Management ───────────────────────────────────────
 

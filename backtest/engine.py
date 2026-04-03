@@ -163,15 +163,28 @@ class StrategyParams:
     # Avoids afternoon lunchtime reversals on positions not yet at SL/TP.
     time_exit_hour: int = 0
 
+    # ── Session window parameters ─────────────────────────────
+    # Controls which session forms the consolidation range and when
+    # breakout entries are looked for.
+    #
+    # London Breakout defaults (22 → 7 spans midnight, so prev-day logic applies):
+    #   range_start_hour=22, range_end_hour=7, entry_start_hour=7, entry_end_hour=9
+    #
+    # NY Open Breakout (all same day, no midnight wrap):
+    #   range_start_hour=9, range_end_hour=13, entry_start_hour=13, entry_end_hour=15
+    #
+    # If range_start_hour > range_end_hour, range is split across midnight
+    # (prev day bars from range_start_hour + curr day bars before range_end_hour).
+    # If range_start_hour < range_end_hour, all bars are same-day.
+    range_start_hour: int = 22
+    range_end_hour:   int = 7
+    entry_start_hour: int = 7
+    entry_end_hour:   int = 9
+
 
 # ── Main Engine ────────────────────────────────────────────────
 
 class BacktestEngine:
-
-    ASIAN_START_HOUR  = 22
-    ASIAN_END_HOUR    = 7
-    LONDON_OPEN_HOUR  = 7
-    LONDON_CLOSE_HOUR = 9
 
     def __init__(self, df: pd.DataFrame, pair: str, params: StrategyParams = None):
         self.df     = df.copy()
@@ -402,15 +415,23 @@ class BacktestEngine:
         if p.excluded_months and day.month in p.excluded_months:
             return None
 
-        # ── Asian range: prev day 22:00 + curr day 00:00–07:00 ─
-        prev_day     = day - timedelta(days=1)
-        prev_bars    = self.df[self.df.index.date == prev_day]
-        prev_session = prev_bars[prev_bars.index.hour >= self.ASIAN_START_HOUR]
+        # ── Consolidation range ────────────────────────────────
+        # If range_start_hour > range_end_hour the range spans midnight
+        # (e.g. 22→7 for Asian session). Otherwise it's a same-day window
+        # (e.g. 9→13 for European morning / NY pre-range).
+        curr_bars = self.df[self.df.index.date == day]
 
-        curr_bars    = self.df[self.df.index.date == day]
-        curr_session = curr_bars[curr_bars.index.hour < self.ASIAN_END_HOUR]
-
-        asian_bars = pd.concat([prev_session, curr_session])
+        if p.range_start_hour > p.range_end_hour:
+            prev_day     = day - timedelta(days=1)
+            prev_bars    = self.df[self.df.index.date == prev_day]
+            prev_session = prev_bars[prev_bars.index.hour >= p.range_start_hour]
+            curr_session = curr_bars[curr_bars.index.hour <  p.range_end_hour]
+            asian_bars   = pd.concat([prev_session, curr_session])
+        else:
+            asian_bars = curr_bars[
+                (curr_bars.index.hour >= p.range_start_hour) &
+                (curr_bars.index.hour <  p.range_end_hour)
+            ]
 
         if len(asian_bars) < 4:
             return None
@@ -426,10 +447,10 @@ class BacktestEngine:
         long_entry  = asian_high + pip_size
         short_entry = asian_low  - pip_size
 
-        # ── London open bars 07:00–09:00 ──────────────────────
+        # ── Entry window bars ──────────────────────────────────
         london_bars = curr_bars[
-            (curr_bars.index.hour >= self.LONDON_OPEN_HOUR) &
-            (curr_bars.index.hour <  self.LONDON_CLOSE_HOUR)
+            (curr_bars.index.hour >= p.entry_start_hour) &
+            (curr_bars.index.hour <  p.entry_end_hour)
         ]
 
         if london_bars.empty:
@@ -442,9 +463,9 @@ class BacktestEngine:
         entry_trend  = None
 
         for ts, bar in london_bars.iterrows():
-            # First-bar filter: stop looking for entries after N minutes past 07:00
+            # First-bar filter: stop looking for entries after N minutes past entry open
             if p.first_bar_minutes > 0:
-                elapsed = ts.hour * 60 + ts.minute - self.LONDON_OPEN_HOUR * 60
+                elapsed = ts.hour * 60 + ts.minute - p.entry_start_hour * 60
                 if elapsed >= p.first_bar_minutes:
                     break
 
