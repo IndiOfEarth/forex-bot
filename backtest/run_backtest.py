@@ -226,6 +226,103 @@ if __name__ == "__main__":
             **NY_WINDOW,
         ), df, "ny_no_friday")
 
+        # ── Phase F: Pullback limit entry configs ─────────────
+        # 22. Pullback 5 pips, 1hr timeout (4 M15 bars)
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            allowed_weekdays=MON_THU,
+            pullback_entry=True,
+            pullback_pips=5.0,
+            pullback_timeout_bars=4,
+        ), df, "pullback_5pip")
+
+        # 23. Pullback 10 pips, 1hr timeout — wider retest zone
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            allowed_weekdays=MON_THU,
+            pullback_entry=True,
+            pullback_pips=10.0,
+            pullback_timeout_bars=4,
+        ), df, "pullback_10pip")
+
+        # 24. Pullback 5 pips, 2hr timeout (8 M15 bars)
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            allowed_weekdays=MON_THU,
+            pullback_entry=True,
+            pullback_pips=5.0,
+            pullback_timeout_bars=8,
+        ), df, "pullback_5pip_2hr")
+
+    # ── Phase G: Tokyo / Asian Session Breakout ────────────────
+    # Range:  20:00–02:00 UTC (NY close → Sydney → early Tokyo consolidation)
+    #         range_start_hour=20 > range_end_hour=2 triggers the midnight-wrap
+    #         branch: prev-day bars >= 20:00 + curr-day bars < 02:00.
+    # Entry:  02:00–06:00 UTC (peak Tokyo liquidity, before London pre-open)
+    # Pairs:  AUD/USD, EUR/JPY, USD/JPY — the three pairs with meaningful
+    #         Asian-session volume in the cached dataset.
+    #
+    # Acceptance gate: OOS PF > 1.4 and > 30 OOS trades.
+    # If a pair clears the gate, wire into strategies/tokyo_breakout.py.
+
+    TOKYO_WINDOW = dict(
+        range_start_hour=20,
+        range_end_hour=2,
+        entry_start_hour=2,
+        entry_end_hour=6,
+    )
+
+    for pair in ["AUD_USD", "EUR_JPY", "USD_JPY"]:
+        df = fetch_historical(client, pair=pair, granularity="M15", years=3)
+        if df.empty:
+            continue
+
+        # 25. Tokyo base — no filters, both directions
+        run(pair, StrategyParams(
+            **TOKYO_WINDOW,
+        ), df, "tokyo_base")
+
+        # 26. Tokyo trend — EMA 21/50/200 alignment required
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **TOKYO_WINDOW,
+        ), df, "tokyo_trend")
+
+        # 27. Tokyo quality — trend + min range 20 pips + body ratio + trailing/partial exit
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            **TOKYO_WINDOW,
+        ), df, "tokyo_quality")
+
+        # 28. Tokyo first-bar 15m — only the 02:00 bar (strongest Tokyo open momentum)
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            first_bar_minutes=15,
+            **TOKYO_WINDOW,
+        ), df, "tokyo_first15m")
+
+        # 29. Tokyo quality + Mon–Thu only
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            allowed_weekdays=MON_THU,
+            **TOKYO_WINDOW,
+        ), df, "tokyo_no_friday")
+
+        # 30. Tokyo quality + force-close at 07:00 UTC (before London open takes over)
+        run(pair, StrategyParams(
+            require_trend_alignment=True,
+            **ALL_IMPROVEMENTS,
+            allowed_weekdays=MON_THU,
+            time_exit_hour=7,
+            **TOKYO_WINDOW,
+        ), df, "tokyo_london_exit")
+
     print("\n[Backtest] Done.\n")
     print("OOS aggregate comparison — check logs/ for per-trade CSVs.")
     print("Improvement targets vs baseline (trend_filter):")

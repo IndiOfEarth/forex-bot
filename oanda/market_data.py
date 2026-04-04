@@ -5,6 +5,7 @@ from config import (
     DEFAULT_GRANULARITY, BREAKOUT_GRANULARITY,
     BREAKOUT_ASIAN_START, BREAKOUT_ASIAN_END,
     EMA_SHORT, EMA_MID, EMA_LONG, RSI_PERIOD,
+    ATR_VOLATILITY_MULTIPLIER,
 )
 
 
@@ -81,6 +82,58 @@ class MarketData:
         df = self.add_atr(df)
         return df
 
+    # ── Macro Regime ───────────────────────────────────────────
+
+    def get_atr_regime(self, pair: str) -> dict:
+        """
+        Compares the current H1 ATR to its 20-bar SMA to detect crisis volatility.
+        Returns:
+            {
+                "is_high_vol": bool,
+                "current_atr": float,
+                "atr_sma":     float,
+                "ratio":       float,   # current_atr / atr_sma
+            }
+        A ratio > ATR_VOLATILITY_MULTIPLIER (default 2.0) flags a high-vol regime.
+        """
+        df = self.get_dataframe(pair, granularity="H1", count=60)
+        if df.empty or len(df) < 34:   # ATR(14) needs 14 bars + 20 for SMA
+            return {"is_high_vol": False, "current_atr": 0.0, "atr_sma": 0.0, "ratio": 1.0}
+        df = self.add_atr(df)
+        df["atr_sma"] = df["atr"].rolling(20).mean()
+        last = df.dropna(subset=["atr_sma"]).iloc[-1]
+        ratio = last["atr"] / last["atr_sma"] if last["atr_sma"] > 0 else 1.0
+        return {
+            "is_high_vol": ratio > ATR_VOLATILITY_MULTIPLIER,
+            "current_atr": round(float(last["atr"]), 6),
+            "atr_sma":     round(float(last["atr_sma"]), 6),
+            "ratio":       round(ratio, 2),
+        }
+
+    def get_daily_trend_state(self, pair: str) -> str:
+        """
+        EMA 50/200 stack on D1 candles — multi-month regime filter.
+        Returns "bullish" | "bearish" | "ranging".
+
+        Uses EMA 50 vs 200 only (not 21): the 21 on D1 covers ~3 weeks and
+        adds noise; 50/200 reflects the slow macro regime (golden/death cross).
+        Requires 250 daily candles (~1 year) for EMA 200 to be valid.
+        """
+        df = self.get_dataframe(pair, granularity="D", count=250)
+        if df.empty or len(df) < EMA_LONG:
+            print(f"  [MarketData] Insufficient D1 data for {pair} — defaulting to ranging")
+            return "ranging"
+        df   = self.add_emas(df)
+        last = df.iloc[-1]
+        e50  = last[f"ema_{EMA_MID}"]
+        e200 = last[f"ema_{EMA_LONG}"]
+        if e50 > e200:
+            return "bullish"
+        elif e50 < e200:
+            return "bearish"
+        else:
+            return "ranging"
+
     # ── Asian Session Range ────────────────────────────────────
 
     def get_asian_range(self, pair: str) -> dict | None:
@@ -124,6 +177,52 @@ class MarketData:
         low  = asian_df["low"].min()
 
         # Convert range to pips (EUR_USD, GBP_USD etc = 4 decimal places)
+        pip_divisor = 0.01 if "JPY" in pair else 0.0001
+        range_pips  = round((high - low) / pip_divisor, 1)
+
+        return {
+            "high":          high,
+            "low":           low,
+            "range_pips":    range_pips,
+            "session_start": session_start,
+            "session_end":   session_end,
+        }
+
+    def get_overnight_range(self, pair: str, range_start_hour: int, range_end_hour: int) -> dict | None:
+        """
+        Calculates the high/low range for a window that spans midnight.
+        e.g. range_start_hour=20, range_end_hour=2 captures prev-day 20:00–23:59
+        plus current-day 00:00–01:59 UTC.
+
+        Used by Tokyo Breakout: call with range_start_hour=20, range_end_hour=2.
+        Returns None if the range period has not yet closed.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Range closes at range_end_hour on the current day
+        range_close = now.replace(hour=range_end_hour, minute=0, second=0, microsecond=0)
+        if now < range_close:
+            print(f"[MarketData] Overnight range {range_start_hour:02d}:00–{range_end_hour:02d}:00 UTC not yet closed.")
+            return None
+
+        # Fetch enough M15 bars to cover the full overnight window
+        # Window = (24 - range_start_hour) + range_end_hour hours, +buffer
+        window_hours = (24 - range_start_hour) + range_end_hour
+        bars_needed  = window_hours * 4 + 10
+        df = self.get_dataframe(pair, granularity="M15", count=bars_needed)
+        if df.empty:
+            return None
+
+        session_start = (range_close - timedelta(hours=window_hours))
+        session_end   = range_close
+
+        range_df = df[(df.index >= session_start) & (df.index < session_end)]
+        if range_df.empty or len(range_df) < 4:
+            print(f"[MarketData] Insufficient overnight range bars for {pair}")
+            return None
+
+        high = range_df["high"].max()
+        low  = range_df["low"].min()
         pip_divisor = 0.01 if "JPY" in pair else 0.0001
         range_pips  = round((high - low) / pip_divisor, 1)
 

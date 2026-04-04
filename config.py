@@ -62,6 +62,20 @@ BREAKOUT_GRANULARITY = "M15" # 15-min for London breakout
 EMA_SHORT  = 21
 EMA_MID    = 50
 EMA_LONG   = 200
+
+# ── Macro Regime Detection ─────────────────────────────────────
+REQUIRE_DAILY_TREND_DEFAULT = False   # opt-in per pair via PAIR_CONFIG
+
+# ATR Volatility Gate
+ATR_VOLATILITY_MULTIPLIER = 2.0    # current ATR > 2× its 20-bar SMA = high-vol regime
+ATR_HIGH_VOL_SIZE_SCALAR  = 0.5    # multiply position size by this in high-vol regime
+ATR_BLOCK_ON_HIGH_VOL     = False  # True = skip trade entirely; False = halve size
+
+# Consecutive Loss Kill-Switch
+CONSECUTIVE_LOSS_LIMIT = 3         # pause rest-of-day after N consecutive closed losses
+
+# Equity Peak Drawdown Guard
+MAX_PEAK_DRAWDOWN = 0.08           # 8% below session peak NAV triggers kill-switch
 RSI_PERIOD = 14
 RSI_LOW    = 40
 RSI_HIGH   = 60

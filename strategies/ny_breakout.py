@@ -10,43 +10,54 @@ from config import (
     MIN_REWARD_RISK,
     EMA_SHORT, EMA_MID, EMA_LONG,
     MOMENTUM_BODY_RATIO,
+    ATR_VOLATILITY_MULTIPLIER, ATR_HIGH_VOL_SIZE_SCALAR, ATR_BLOCK_ON_HIGH_VOL,
 )
 
 
 # ── Per-pair configuration ─────────────────────────────────────
-# Conservative defaults until walk-forward backtest (configs 17–21 in
-# run_backtest.py) confirms optimal per-pair settings.
+# Derived from walk-forward backtest (config 21: ny_no_friday).
 # DO NOT change these without re-running the walk-forward backtest.
 #
 # European range window: 09:00–13:00 UTC
 # Entry window:          13:00–15:00 UTC (NY open / London–NY overlap)
 #
-# Tuning notes (update after backtest):
-#   - first_bar_minutes=15 means only the 13:00 bar fires (matching the
-#     London strategy's strongest-first-bar pattern).
-#   - require_4h_trend: to be assessed per-pair from backtest results.
-#   - allowed_weekdays=(0,1,2,3): same Friday exclusion as London strategy.
+# Validated OOS results (3-year walk-forward, ny_no_friday config):
+#   EUR_USD : PF 1.29,  126 OOS trades,  +347 pips
+#   GBP_USD : PF 1.72,  130 OOS trades,  +975 pips
+#   USD_JPY : PF 1.82,  143 OOS trades, +1462 pips
+#
+# Key findings vs London strategy:
+#   - first_bar_minutes=15 HURTS NY (GBP/USD PF drops from 1.72 → 0.65).
+#     Unlike London, the NY breakout extends throughout 13:00–15:00 UTC,
+#     not just the opening bar. first_bar_minutes=0 for all pairs.
+#   - H4 trend confirmation adds no value for any NY pair (tested in
+#     ny_quality config). H1 trend alignment alone is sufficient.
+#   - Friday exclusion is the single biggest improvement across all pairs.
+#     Friday NY sessions have low follow-through on breakouts.
 #
 NY_PAIR_CONFIG = {
     "EUR_USD": {
         "allowed_directions":      ("buy", "sell"),
         "require_trend_alignment": True,
         "require_4h_trend":        False,
-        "first_bar_minutes":       15,
+        "require_daily_trend":     True,
+        "first_bar_minutes":       0,
         "allowed_weekdays":        (0, 1, 2, 3),
     },
     "GBP_USD": {
         "allowed_directions":      ("buy", "sell"),
         "require_trend_alignment": True,
         "require_4h_trend":        False,
-        "first_bar_minutes":       15,
+        "require_daily_trend":     True,
+        "first_bar_minutes":       0,
         "allowed_weekdays":        (0, 1, 2, 3),
     },
     "USD_JPY": {
         "allowed_directions":      ("buy", "sell"),
         "require_trend_alignment": True,
         "require_4h_trend":        False,
-        "first_bar_minutes":       15,
+        "require_daily_trend":     True,
+        "first_bar_minutes":       0,
         "allowed_weekdays":        (0, 1, 2, 3),
     },
 }
@@ -148,6 +159,7 @@ class NYBreakout:
         allowed_directions      = cfg["allowed_directions"]
         require_trend_alignment = cfg["require_trend_alignment"]
         require_4h_trend        = cfg.get("require_4h_trend", False)
+        require_daily_trend     = cfg.get("require_daily_trend", False)
         first_bar_minutes       = cfg.get("first_bar_minutes", 15)
         allowed_weekdays        = cfg.get("allowed_weekdays", ())
 
@@ -209,6 +221,14 @@ class NYBreakout:
         h4_trend = "ranging"
         if require_4h_trend:
             h4_trend = self._get_h4_trend_state(pair)
+            print(f"  H4 trend    : {h4_trend.upper()}")
+
+        # 9b. D1 macro regime filter — EMA 50/200 death/golden cross
+        if require_daily_trend:
+            d1_trend = self.md.get_daily_trend_state(pair)
+            print(f"  D1 trend    : {d1_trend.upper()}")
+        else:
+            d1_trend = None
 
         # 10. Breakout detection + filters
         direction   = None
@@ -221,6 +241,9 @@ class NYBreakout:
             if require_4h_trend and h4_trend != "bullish":
                 print(f"  ❌ Long signal blocked — H4 trend is {h4_trend}")
                 return None
+            if require_daily_trend and d1_trend != "bullish":
+                print(f"  ❌ Long signal blocked — D1 trend not bullish ({d1_trend})")
+                return None
             direction   = "buy"
             entry_price = ask
 
@@ -231,6 +254,9 @@ class NYBreakout:
             if require_4h_trend and h4_trend != "bearish":
                 print(f"  ❌ Short signal blocked — H4 trend is {h4_trend}")
                 return None
+            if require_daily_trend and d1_trend != "bearish":
+                print(f"  ❌ Short signal blocked — D1 trend not bearish ({d1_trend})")
+                return None
             direction   = "sell"
             entry_price = bid
 
@@ -238,6 +264,18 @@ class NYBreakout:
             print(f"  — No breakout: ask={ask:.5f}, bid={bid:.5f}, "
                   f"long={long_entry:.5f}, short={short_entry:.5f}")
             return None
+
+        # 10a. ATR volatility regime gate
+        vol_scalar = 1.0
+        atr_regime = self.md.get_atr_regime(pair)
+        vol_label  = "HIGH-VOL" if atr_regime["is_high_vol"] else "normal"
+        print(f"  ATR regime  : {vol_label} (ratio {atr_regime['ratio']}x)")
+        if atr_regime["is_high_vol"]:
+            if ATR_BLOCK_ON_HIGH_VOL:
+                print(f"  ❌ High-vol regime — trade blocked (ATR {atr_regime['ratio']}x baseline)")
+                return None
+            vol_scalar = ATR_HIGH_VOL_SIZE_SCALAR
+            print(f"  ⚠️  High-vol regime — size reduced to {vol_scalar}x")
 
         # 11. Momentum body ratio — fetch M15 candles, check last closed bar
         m15 = self.md.get_dataframe(pair, granularity="M15", count=5)
@@ -292,6 +330,7 @@ class NYBreakout:
             asian_range_pips=range_pips,
             trend_state=trend_state,
             timestamp=now,
+            vol_scalar=vol_scalar,
         )
 
     # ── Trend State ────────────────────────────────────────────

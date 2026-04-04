@@ -2,6 +2,7 @@ import oandapyV20
 import oandapyV20.endpoints.accounts as accounts
 import oandapyV20.endpoints.pricing as pricing
 import oandapyV20.endpoints.instruments as instruments
+import oandapyV20.endpoints.trades as trades_ep
 
 from config import OANDA_API_KEY, OANDA_ACCOUNT_ID, OANDA_ENVIRONMENT
 
@@ -106,6 +107,23 @@ class OandaClient:
                 "volume": int(c["volume"]),
             })
         return candles
+
+    # ── Trade History ─────────────────────────────────────────
+
+    def get_recent_closed_trade_outcomes(self, count: int = 5) -> list[str]:
+        """
+        Returns the last `count` closed trades as a list of "win" or "loss" strings,
+        ordered chronologically (oldest first). A trade is a win if realizedPL > 0.
+        """
+        params = {"state": "CLOSED", "count": str(count)}
+        r = trades_ep.TradesList(self.account_id, params=params)
+        self.client.request(r)
+        outcomes = []
+        for t in r.response.get("trades", []):
+            pl = float(t.get("realizedPL", 0))
+            outcomes.append("win" if pl > 0 else "loss")
+        outcomes.reverse()   # OANDA returns newest-first; reverse to chronological
+        return outcomes
 
     # ── Connection Test ────────────────────────────────────────
 

@@ -1,7 +1,8 @@
 from datetime import datetime, timezone, date
 from oanda.client import OandaClient
 from config import (
-    RISK_PER_TRADE, MAX_DAILY_LOSS, MAX_OPEN_POSITIONS, MIN_REWARD_RISK
+    RISK_PER_TRADE, MAX_DAILY_LOSS, MAX_OPEN_POSITIONS, MIN_REWARD_RISK,
+    CONSECUTIVE_LOSS_LIMIT, MAX_PEAK_DRAWDOWN,
 )
 
 
@@ -12,9 +13,10 @@ class RiskManager:
     """
 
     def __init__(self, client: OandaClient):
-        self.client       = client
+        self.client                = client
         self._daily_start_balance: float | None = None
         self._daily_date:          date  | None = None
+        self._peak_balance:        float | None = None
 
     # ── Daily Loss Tracking ────────────────────────────────────
 
@@ -38,6 +40,49 @@ class RiskManager:
         drawdown = self.get_daily_drawdown()
         if drawdown >= MAX_DAILY_LOSS:
             return True, f"Daily loss limit reached: {drawdown*100:.2f}% (max {MAX_DAILY_LOSS*100:.0f}%)"
+        return False, ""
+
+    # ── Consecutive Loss Kill-Switch ───────────────────────────
+
+    def is_consecutive_loss_limit_breached(self) -> tuple[bool, str]:
+        """
+        Returns (True, reason) if the last CONSECUTIVE_LOSS_LIMIT closed trades
+        were all losses. Reads live OANDA trade history — no in-memory state,
+        so it resets automatically once a winning trade is closed.
+        """
+        outcomes = self.client.get_recent_closed_trade_outcomes(count=CONSECUTIVE_LOSS_LIMIT)
+        if len(outcomes) < CONSECUTIVE_LOSS_LIMIT:
+            return False, ""
+        if all(o == "loss" for o in outcomes):
+            return True, (
+                f"Consecutive loss limit: last {CONSECUTIVE_LOSS_LIMIT} closed trades "
+                f"all losses — pausing for rest of day"
+            )
+        return False, ""
+
+    # ── Equity Peak Drawdown Guard ─────────────────────────────
+
+    def get_peak_drawdown(self) -> float:
+        """
+        Returns drawdown from the in-session equity peak as a fraction.
+        Updates the peak on every call if current NAV is higher.
+        e.g. 0.05 = 5% below peak.
+        """
+        current = self.client.get_nav()
+        if self._peak_balance is None or current > self._peak_balance:
+            self._peak_balance = current
+        if self._peak_balance == 0:
+            return 0.0
+        return (self._peak_balance - current) / self._peak_balance
+
+    def is_peak_drawdown_breached(self) -> tuple[bool, str]:
+        """Returns (True, reason) if NAV has fallen MAX_PEAK_DRAWDOWN below session peak."""
+        dd = self.get_peak_drawdown()
+        if dd >= MAX_PEAK_DRAWDOWN:
+            return True, (
+                f"Peak drawdown limit reached: {dd*100:.2f}% below peak "
+                f"${self._peak_balance:,.2f} (max {MAX_PEAK_DRAWDOWN*100:.0f}%)"
+            )
         return False, ""
 
     # ── Open Position Check ────────────────────────────────────
@@ -187,6 +232,16 @@ class RiskManager:
         if breached:
             blocks.append(reason)
 
+        # Consecutive loss kill-switch
+        consec, reason = self.is_consecutive_loss_limit_breached()
+        if consec:
+            blocks.append(reason)
+
+        # Peak drawdown guard
+        peak_hit, reason = self.is_peak_drawdown_breached()
+        if peak_hit:
+            blocks.append(reason)
+
         # Max positions
         maxed, reason = self.is_max_positions_reached()
         if maxed:
@@ -230,4 +285,13 @@ class RiskManager:
         print(f"  Daily Start   : ${self._daily_start_balance:,.2f}")
         limit_hit, _ = self.is_daily_limit_breached()
         print(f"  Kill-switch   : {'🔴 ACTIVE' if limit_hit else '🟢 OK'}")
+
+        consec_hit, _ = self.is_consecutive_loss_limit_breached()
+        print(f"  Consec Loss   : {'🔴 LIMIT HIT' if consec_hit else '🟢 OK'}")
+
+        peak_dd = self.get_peak_drawdown()
+        peak_hit, _ = self.is_peak_drawdown_breached()
+        peak_str = f"${self._peak_balance:,.2f}" if self._peak_balance else "not set"
+        print(f"  Peak DD       : {peak_dd*100:.2f}% from {peak_str} (limit {MAX_PEAK_DRAWDOWN*100:.0f}%)")
+        print(f"  Peak Guard    : {'🔴 ACTIVE' if peak_hit else '🟢 OK'}")
         print()

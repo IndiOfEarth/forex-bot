@@ -181,6 +181,16 @@ class StrategyParams:
     entry_start_hour: int = 7
     entry_end_hour:   int = 9
 
+    # ── Pullback limit entry ───────────────────────────────────
+    # Instead of entering at market when price crosses the breakout level,
+    # wait for price to pull back to (trigger - pullback_pips) before filling.
+    # This improves R:R by tightening the effective entry, eliminates wick
+    # breakouts, and filters breakouts with no retest conviction.
+    # pullback_entry=False → identical to current market-entry behaviour.
+    pullback_entry:        bool  = False
+    pullback_pips:         float = 5.0
+    pullback_timeout_bars: int   = 4    # M15 bars; 4 = 1 hour, 8 = 2 hours
+
 
 # ── Main Engine ────────────────────────────────────────────────
 
@@ -462,6 +472,13 @@ class BacktestEngine:
         entry_regime = None
         entry_trend  = None
 
+        # Pullback pending state — only used when p.pullback_entry=True
+        pending_direction = None   # "buy" | "sell" | None
+        pending_entry_px  = None   # limit price to fill at
+        pending_bars_left = 0      # countdown to auto-cancel
+        pending_regime    = None
+        pending_trend     = None
+
         for ts, bar in london_bars.iterrows():
             # First-bar filter: stop looking for entries after N minutes past entry open
             if p.first_bar_minutes > 0:
@@ -473,6 +490,10 @@ class BacktestEngine:
 
             # ADX check — shared across both directions
             if p.require_adx and bar.get("adx", 0) < p.min_adx:
+                if pending_direction:
+                    pending_bars_left -= 1
+                    if pending_bars_left <= 0:
+                        pending_direction = None
                 continue
 
             # H4 trend lookup — shared lookup, checked per-direction below
@@ -482,7 +503,31 @@ class BacktestEngine:
                 if not h4_before.empty:
                     h4_trend = h4_before.iloc[-1]["h4_trend"]
 
-            if bar["high"] >= long_entry and direction is None:
+            # ── Pullback fill check (runs before new breakout detection) ──
+            if p.pullback_entry and pending_direction is not None:
+                if pending_direction == "buy" and bar["low"] <= pending_entry_px:
+                    direction    = "buy"
+                    entry_price  = pending_entry_px + self._pips_to_price(
+                        p.slippage_pips + p.spread_pips / 2)
+                    entry_time   = ts
+                    entry_regime = pending_regime
+                    entry_trend  = pending_trend
+                    break
+                elif pending_direction == "sell" and bar["high"] >= pending_entry_px:
+                    direction    = "sell"
+                    entry_price  = pending_entry_px - self._pips_to_price(
+                        p.slippage_pips + p.spread_pips / 2)
+                    entry_time   = ts
+                    entry_regime = pending_regime
+                    entry_trend  = pending_trend
+                    break
+                else:
+                    pending_bars_left -= 1
+                    if pending_bars_left <= 0:
+                        pending_direction = None   # timed out — no fill
+                    continue   # still waiting for pullback
+
+            if bar["high"] >= long_entry and direction is None and pending_direction is None:
                 # Direction filter — skip if longs not allowed
                 if "buy" not in p.allowed_directions:
                     continue
@@ -496,6 +541,14 @@ class BacktestEngine:
                     bar_body  = abs(bar["close"] - bar["open"])
                     if bar_range > 0 and bar_body / bar_range < p.momentum_body_ratio:
                         continue
+                if p.pullback_entry:
+                    # Set pending limit order; don't fill yet
+                    pending_direction = "buy"
+                    pending_entry_px  = long_entry - self._pips_to_price(p.pullback_pips)
+                    pending_bars_left = p.pullback_timeout_bars
+                    pending_regime    = bar.get("regime", "unknown")
+                    pending_trend     = bar_trend
+                    continue
                 direction    = "buy"
                 entry_price  = long_entry + self._pips_to_price(
                     p.slippage_pips + p.spread_pips / 2)
@@ -504,7 +557,7 @@ class BacktestEngine:
                 entry_trend  = bar_trend
                 break
 
-            elif bar["low"] <= short_entry and direction is None:
+            elif bar["low"] <= short_entry and direction is None and pending_direction is None:
                 # Direction filter — skip if shorts not allowed
                 if "sell" not in p.allowed_directions:
                     continue
@@ -518,6 +571,14 @@ class BacktestEngine:
                     bar_body  = abs(bar["close"] - bar["open"])
                     if bar_range > 0 and bar_body / bar_range < p.momentum_body_ratio:
                         continue
+                if p.pullback_entry:
+                    # Set pending limit order; don't fill yet
+                    pending_direction = "sell"
+                    pending_entry_px  = short_entry + self._pips_to_price(p.pullback_pips)
+                    pending_bars_left = p.pullback_timeout_bars
+                    pending_regime    = bar.get("regime", "unknown")
+                    pending_trend     = bar_trend
+                    continue
                 direction    = "sell"
                 entry_price  = short_entry - self._pips_to_price(
                     p.slippage_pips + p.spread_pips / 2)
