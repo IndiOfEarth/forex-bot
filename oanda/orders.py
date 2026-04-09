@@ -81,7 +81,7 @@ class OrderExecutor:
 
         try:
             r = orders.OrderCreate(self.client.account_id, data=data)
-            self.client.client.request(r)
+            self.client._request(r)
             response = r.response
 
             trade_id = response.get("orderFillTransaction", {}).get("tradeOpened", {}).get("tradeID")
@@ -167,7 +167,7 @@ class OrderExecutor:
         """Returns all currently open trades."""
         try:
             r = trades.OpenTrades(self.client.account_id)
-            self.client.client.request(r)
+            self.client._request(r)
             return r.response.get("trades", [])
         except Exception as e:
             print(f"[Orders] Failed to fetch open trades: {e}")
@@ -177,7 +177,7 @@ class OrderExecutor:
         """Closes a specific trade by ID."""
         try:
             r = trades.TradeClose(self.client.account_id, tradeID=trade_id)
-            self.client.client.request(r)
+            self.client._request(r)
             print(f"[Orders] ✅ Trade {trade_id} closed.")
             return r.response
         except Exception as e:
@@ -200,7 +200,7 @@ class OrderExecutor:
         try:
             data = {"stopLoss": {"price": f"{new_sl:.5f}", "timeInForce": "GTC"}}
             r = trades.TradeCRCDO(self.client.account_id, tradeID=trade_id, data=data)
-            self.client.client.request(r)
+            self.client._request(r)
             print(f"[Orders] Stop loss moved to {new_sl:.5f} on trade {trade_id}")
             return r.response
         except Exception as e:
@@ -287,7 +287,7 @@ class OrderExecutor:
         try:
             data = {"units": str(close_units)}
             r = trades.TradeClose(self.client.account_id, tradeID=trade_id, data=data)
-            self.client.client.request(r)
+            self.client._request(r)
             print(f"[Orders] Partial close: {units:,} units on {pair} (trade {trade_id})")
         except Exception as e:
             print(f"[Orders] ❌ Partial close failed on {trade_id}: {e}")

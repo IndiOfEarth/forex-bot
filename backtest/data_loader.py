@@ -68,7 +68,7 @@ def fetch_historical(
 
         try:
             r = instruments.InstrumentsCandles(pair, params=params)
-            client.client.request(r)
+            client._request(r)
 
             chunk = []
             for c in r.response["candles"]:

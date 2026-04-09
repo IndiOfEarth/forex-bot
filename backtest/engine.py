@@ -191,6 +191,16 @@ class StrategyParams:
     pullback_pips:         float = 5.0
     pullback_timeout_bars: int   = 4    # M15 bars; 4 = 1 hour, 8 = 2 hours
 
+    # ── News fade mode ────────────────────────────────────────
+    # When True, _simulate_day is replaced by _simulate_news_fade_day.
+    # Detects large M15 spike bars and places a limit fade entry at the
+    # Fibonacci retracement level. Backtest-only — not wired into live bot.
+    is_news_fade:          bool  = False
+    fade_min_spike_pips:   float = 40.0
+    fade_fibo_level:       float = 0.618
+    fade_stop_buffer_pips: float = 5.0
+    fade_tp_retracement:   float = 0.0   # 0.0 = full reversion; 0.382 = partial
+
 
 # ── Main Engine ────────────────────────────────────────────────
 
@@ -417,6 +427,9 @@ class BacktestEngine:
         per-bar so there's no look-ahead — we only know the EMA values up to
         that bar, same as live trading.
         """
+        if self.params.is_news_fade:
+            return self._simulate_news_fade_day(day, window_label)
+
         p = self.params
 
         # ── Seasonality filters ────────────────────────────────
@@ -790,6 +803,259 @@ class BacktestEngine:
             trend_state=entry_trend,
             window_label=window_label,
             asian_range_pips=round(range_pips, 1),
+        )
+
+    # ── News Fade Day Simulation ───────────────────────────────
+
+    def _simulate_news_fade_day(self, day: date, window_label: str) -> BacktestTrade | None:
+        """
+        Looks for a large spike bar during the entry window (07:00–15:00 UTC)
+        and places a limit fade entry at the Fibonacci retracement level.
+        Fill is confirmed if price returns to entry level within 4 bars (1 hour).
+        Applies the same trailing/partial-close exit logic as breakout trades.
+        """
+        p        = self.params
+        curr_bars = self.df[self.df.index.date == day]
+
+        if p.allowed_weekdays and day.weekday() not in p.allowed_weekdays:
+            return None
+        if p.excluded_months and day.month in p.excluded_months:
+            return None
+
+        entry_bars = curr_bars[
+            (curr_bars.index.hour >= p.entry_start_hour) &
+            (curr_bars.index.hour <  p.entry_end_hour)
+        ]
+        if entry_bars.empty:
+            return None
+
+        pip_size = 0.01 if "JPY" in self.pair else 0.0001
+
+        direction   = None
+        entry_price = None
+        entry_time  = None
+        stop_loss   = None
+        take_profit = None
+
+        # Scan for spike bars; attempt limit fill within FILL_TIMEOUT_BARS after each
+        FILL_TIMEOUT_BARS = 4
+
+        bar_list = list(entry_bars.iterrows())
+        for i, (ts, bar) in enumerate(bar_list):
+            bar_range_pips = (bar["high"] - bar["low"]) / pip_size
+            if bar_range_pips < p.fade_min_spike_pips:
+                continue
+
+            is_bullish = bar["close"] > bar["open"]
+
+            if is_bullish:
+                cand_direction   = "sell"
+                cand_entry       = bar["high"] - p.fade_fibo_level * (bar["high"] - bar["low"])
+                cand_stop        = bar["high"] + p.fade_stop_buffer_pips * pip_size
+                cand_tp          = bar["open"] + p.fade_tp_retracement * (bar["high"] - bar["open"])
+            else:
+                cand_direction   = "buy"
+                cand_entry       = bar["low"] + p.fade_fibo_level * (bar["high"] - bar["low"])
+                cand_stop        = bar["low"] - p.fade_stop_buffer_pips * pip_size
+                cand_tp          = bar["open"] - p.fade_tp_retracement * (bar["open"] - bar["low"])
+
+            cand_stop_pips   = abs(cand_entry - cand_stop) / pip_size
+            cand_target_pips = abs(cand_tp - cand_entry) / pip_size
+
+            if cand_stop_pips <= 0 or cand_target_pips <= 0:
+                continue
+
+            # Look for limit fill within the next FILL_TIMEOUT_BARS
+            fill_bars = bar_list[i + 1 : i + 1 + FILL_TIMEOUT_BARS]
+            for fill_ts, fill_bar in fill_bars:
+                if cand_direction == "buy" and fill_bar["low"] <= cand_entry:
+                    direction   = "buy"
+                    entry_price = cand_entry + self._pips_to_price(p.slippage_pips + p.spread_pips / 2)
+                    entry_time  = fill_ts
+                    stop_loss   = cand_stop
+                    take_profit = cand_tp
+                    break
+                elif cand_direction == "sell" and fill_bar["high"] >= cand_entry:
+                    direction   = "sell"
+                    entry_price = cand_entry - self._pips_to_price(p.slippage_pips + p.spread_pips / 2)
+                    entry_time  = fill_ts
+                    stop_loss   = cand_stop
+                    take_profit = cand_tp
+                    break
+
+            if direction:
+                break
+
+        if not direction:
+            return None
+
+        stop_pips   = self._price_to_pips(abs(entry_price - stop_loss))
+        target_pips = self._price_to_pips(abs(take_profit - entry_price))
+        rr          = target_pips / stop_pips if stop_pips > 0 else 0
+
+        if rr < p.min_rr:
+            return None
+
+        # Reuse the same exit simulation as breakout trades
+        post_entry_bars = curr_bars[curr_bars.index > entry_time]
+        r1_dist         = abs(entry_price - stop_loss)
+        trail_sl        = stop_loss
+        partial_closed  = False
+        partial_pnl_pips = 0.0
+
+        trail_trigger_px = None
+        partial_close_px = None
+        full_tp_px       = None
+
+        if p.trail_trigger_r > 0:
+            trail_trigger_px = (
+                entry_price + r1_dist * p.trail_trigger_r if direction == "buy"
+                else entry_price - r1_dist * p.trail_trigger_r
+            )
+        if p.partial_close_r > 0:
+            partial_close_px = (
+                entry_price + r1_dist * p.partial_close_r if direction == "buy"
+                else entry_price - r1_dist * p.partial_close_r
+            )
+            full_tp_px = (
+                entry_price + r1_dist * p.full_tp_r if direction == "buy"
+                else entry_price - r1_dist * p.full_tp_r
+            )
+
+        exit_price       = None
+        exit_time        = None
+        outcome          = None
+        pnl_pips_blended = None
+
+        for ts, bar in post_entry_bars.iterrows():
+            if p.time_exit_hour > 0 and ts.hour >= p.time_exit_hour:
+                exit_price = bar["open"]
+                exit_time  = ts
+                if partial_closed:
+                    remaining = (self._price_to_pips(exit_price - entry_price) if direction == "buy"
+                                 else self._price_to_pips(entry_price - exit_price))
+                    pnl_pips_blended = (p.partial_close_pct * partial_pnl_pips
+                                        + (1 - p.partial_close_pct) * remaining)
+                    outcome = "partial_win" if pnl_pips_blended > 0 else "breakeven"
+                else:
+                    raw = (self._price_to_pips(exit_price - entry_price) if direction == "buy"
+                           else self._price_to_pips(entry_price - exit_price))
+                    outcome = "win" if raw > 0 else ("loss" if raw < -self._pips_to_price(1) else "breakeven")
+                break
+
+            if direction == "buy":
+                if trail_trigger_px and bar["high"] >= trail_trigger_px:
+                    be_px = entry_price + self._pips_to_price(1)
+                    if be_px > trail_sl:
+                        trail_sl = be_px
+                if partial_close_px and not partial_closed and bar["high"] >= partial_close_px:
+                    partial_pnl_pips = self._price_to_pips(partial_close_px - entry_price)
+                    partial_closed   = True
+                    if p.trail_lock_r > 0:
+                        lock_px = entry_price + r1_dist * p.trail_lock_r
+                        if lock_px > trail_sl:
+                            trail_sl = lock_px
+                if bar["low"] <= trail_sl:
+                    sl_exit = trail_sl - self._pips_to_price(p.slippage_pips)
+                    if partial_closed:
+                        remaining = self._price_to_pips(trail_sl - entry_price)
+                        pnl_pips_blended = (p.partial_close_pct * partial_pnl_pips
+                                            + (1 - p.partial_close_pct) * remaining)
+                        outcome = "partial_win" if pnl_pips_blended > 0 else "loss"
+                    else:
+                        outcome = "loss" if abs(trail_sl - stop_loss) < 1e-8 else "breakeven"
+                    exit_price = sl_exit
+                    exit_time  = ts
+                    break
+                effective_tp = full_tp_px if partial_closed else take_profit
+                if bar["high"] >= effective_tp:
+                    exit_price = effective_tp
+                    exit_time  = ts
+                    if partial_closed:
+                        remaining = self._price_to_pips(full_tp_px - entry_price)
+                        pnl_pips_blended = (p.partial_close_pct * partial_pnl_pips
+                                            + (1 - p.partial_close_pct) * remaining)
+                    outcome = "win"
+                    break
+
+            else:  # sell
+                if trail_trigger_px and bar["low"] <= trail_trigger_px:
+                    be_px = entry_price - self._pips_to_price(1)
+                    if be_px < trail_sl:
+                        trail_sl = be_px
+                if partial_close_px and not partial_closed and bar["low"] <= partial_close_px:
+                    partial_pnl_pips = self._price_to_pips(entry_price - partial_close_px)
+                    partial_closed   = True
+                    if p.trail_lock_r > 0:
+                        lock_px = entry_price - r1_dist * p.trail_lock_r
+                        if lock_px < trail_sl:
+                            trail_sl = lock_px
+                if bar["high"] >= trail_sl:
+                    sl_exit = trail_sl + self._pips_to_price(p.slippage_pips)
+                    if partial_closed:
+                        remaining = self._price_to_pips(entry_price - trail_sl)
+                        pnl_pips_blended = (p.partial_close_pct * partial_pnl_pips
+                                            + (1 - p.partial_close_pct) * remaining)
+                        outcome = "partial_win" if pnl_pips_blended > 0 else "loss"
+                    else:
+                        outcome = "loss" if abs(trail_sl - stop_loss) < 1e-8 else "breakeven"
+                    exit_price = sl_exit
+                    exit_time  = ts
+                    break
+                effective_tp = full_tp_px if partial_closed else take_profit
+                if bar["low"] <= effective_tp:
+                    exit_price = effective_tp
+                    exit_time  = ts
+                    if partial_closed:
+                        remaining = self._price_to_pips(entry_price - full_tp_px)
+                        pnl_pips_blended = (p.partial_close_pct * partial_pnl_pips
+                                            + (1 - p.partial_close_pct) * remaining)
+                    outcome = "win"
+                    break
+
+        if outcome is None and not post_entry_bars.empty:
+            exit_price = post_entry_bars.iloc[-1]["close"]
+            exit_time  = post_entry_bars.index[-1]
+            if partial_closed:
+                remaining = (self._price_to_pips(exit_price - entry_price) if direction == "buy"
+                             else self._price_to_pips(entry_price - exit_price))
+                pnl_pips_blended = (p.partial_close_pct * partial_pnl_pips
+                                    + (1 - p.partial_close_pct) * remaining)
+                outcome = "partial_win" if pnl_pips_blended > 0 else "breakeven"
+            else:
+                outcome = "breakeven"
+
+        if exit_price is None:
+            return None
+
+        if pnl_pips_blended is not None:
+            pnl_pips = pnl_pips_blended
+        elif direction == "buy":
+            pnl_pips = self._price_to_pips(exit_price - entry_price)
+        else:
+            pnl_pips = self._price_to_pips(entry_price - exit_price)
+
+        pnl_pct = (pnl_pips / stop_pips) * RISK_PER_TRADE if stop_pips > 0 else 0
+
+        return BacktestTrade(
+            pair        = self.pair,
+            direction   = direction,
+            entry_time  = entry_time,
+            entry_price = entry_price,
+            stop_loss   = stop_loss,
+            take_profit = take_profit,
+            stop_pips   = stop_pips,
+            target_pips = target_pips,
+            rr_ratio    = round(rr, 2),
+            exit_time   = exit_time,
+            exit_price  = exit_price,
+            outcome     = outcome,
+            pnl_pips    = round(pnl_pips, 1),
+            pnl_pct     = round(pnl_pct * 100, 3),
+            regime      = "news_fade",
+            trend_state = direction,
+            window_label = window_label,
+            asian_range_pips = None,
         )
 
     # ── Pip Utilities ──────────────────────────────────────────

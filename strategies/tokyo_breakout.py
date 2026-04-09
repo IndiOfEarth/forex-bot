@@ -12,6 +12,8 @@ from config import (
     BREAKOUT_ASIAN_MIN_PIPS,
     MOMENTUM_BODY_RATIO,
     ATR_VOLATILITY_MULTIPLIER, ATR_HIGH_VOL_SIZE_SCALAR, ATR_BLOCK_ON_HIGH_VOL,
+    ATR_STOP_MULTIPLIER,
+    LONDON_OPEN_UTC,
 )
 
 
@@ -58,7 +60,7 @@ TOKYO_PAIR_CONFIG = {
         "require_trend_alignment": True,
         "first_bar_minutes":       0,
         "allowed_weekdays":        (0, 1, 2, 3),  # Mon–Thu
-        "time_exit_hour":          7,              # force-close before London open
+        "time_exit_hour":          LONDON_OPEN_UTC, # force-close before London open
     },
     "USD_JPY": {
         "allowed_directions":      ("buy", "sell"),
@@ -310,7 +312,7 @@ class TokyoBreakout:
 
         # 9. Calculate levels
         stop_loss, take_profit, stop_pips, target_pips = self._calculate_levels(
-            direction, entry_price, session, pair
+            direction, entry_price, session, pair, atr_regime["current_atr"]
         )
 
         # 10. RR check
@@ -371,18 +373,28 @@ class TokyoBreakout:
 
     def _calculate_levels(
         self,
-        direction: str,
-        entry:     float,
-        session:   dict,
-        pair:      str,
+        direction:   str,
+        entry:       float,
+        session:     dict,
+        pair:        str,
+        current_atr: float = 0.0,
     ) -> tuple[float, float, float, float]:
-        pip = self.md.pips_to_price(BREAKOUT_BUFFER_PIPS, pair)
+        if current_atr > 0:
+            atr_dist = ATR_STOP_MULTIPLIER * current_atr
+            if direction == "buy":
+                stop_loss = entry - atr_dist
+            else:
+                stop_loss = entry + atr_dist
+        else:
+            pip = self.md.pips_to_price(BREAKOUT_BUFFER_PIPS, pair)
+            if direction == "buy":
+                stop_loss = session["low"]  - pip
+            else:
+                stop_loss = session["high"] + pip
 
         if direction == "buy":
-            stop_loss   = session["low"]  - pip
             take_profit = entry + (entry - stop_loss) * self.REWARD_RISK
         else:
-            stop_loss   = session["high"] + pip
             take_profit = entry - (stop_loss - entry) * self.REWARD_RISK
 
         stop_pips   = self.md.price_to_pips(abs(entry - stop_loss), pair)

@@ -1,3 +1,6 @@
+import time
+import requests.exceptions
+
 import oandapyV20
 import oandapyV20.endpoints.accounts as accounts
 import oandapyV20.endpoints.pricing as pricing
@@ -5,6 +8,11 @@ import oandapyV20.endpoints.instruments as instruments
 import oandapyV20.endpoints.trades as trades_ep
 
 from config import OANDA_API_KEY, OANDA_ACCOUNT_ID, OANDA_ENVIRONMENT
+
+_RETRY_EXCEPTIONS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
 
 
 class OandaClient:
@@ -21,12 +29,25 @@ class OandaClient:
         )
         print(f"[OandaClient] Connected — environment: {OANDA_ENVIRONMENT.upper()}")
 
+    def _request(self, endpoint, retries: int = 3, backoff: float = 5.0):
+        """Execute an oandapyV20 request with retry on transient network errors."""
+        for attempt in range(1, retries + 1):
+            try:
+                self.client.request(endpoint)
+                return
+            except _RETRY_EXCEPTIONS as e:
+                if attempt == retries:
+                    raise
+                wait = backoff * attempt
+                print(f"[OandaClient] Network error (attempt {attempt}/{retries}): {e}. Retrying in {wait:.0f}s...")
+                time.sleep(wait)
+
     # ── Account ────────────────────────────────────────────────
 
     def get_account_summary(self) -> dict:
         """Returns account balance, NAV, margin, open trade count."""
         r = accounts.AccountSummary(self.account_id)
-        self.client.request(r)
+        self._request(r)
         return r.response["account"]
 
     def get_account_balance(self) -> float:
@@ -51,7 +72,7 @@ class OandaClient:
         """
         params = {"instruments": pair}
         r = pricing.PricingInfo(self.account_id, params=params)
-        self.client.request(r)
+        self._request(r)
         price_data = r.response["prices"][0]
         return {
             "pair":    pair,
@@ -65,7 +86,7 @@ class OandaClient:
         """Returns bid/ask for multiple pairs at once."""
         params = {"instruments": ",".join(pairs)}
         r = pricing.PricingInfo(self.account_id, params=params)
-        self.client.request(r)
+        self._request(r)
         results = []
         for p in r.response["prices"]:
             results.append({
@@ -92,7 +113,7 @@ class OandaClient:
             "price": "M",  # midpoint candles
         }
         r = instruments.InstrumentsCandles(pair, params=params)
-        self.client.request(r)
+        self._request(r)
 
         candles = []
         for c in r.response["candles"]:
@@ -117,7 +138,7 @@ class OandaClient:
         """
         params = {"state": "CLOSED", "count": str(count)}
         r = trades_ep.TradesList(self.account_id, params=params)
-        self.client.request(r)
+        self._request(r)
         outcomes = []
         for t in r.response.get("trades", []):
             pl = float(t.get("realizedPL", 0))

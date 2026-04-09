@@ -11,6 +11,7 @@ from config import (
     EMA_SHORT, EMA_MID, EMA_LONG,
     MOMENTUM_BODY_RATIO,
     ATR_VOLATILITY_MULTIPLIER, ATR_HIGH_VOL_SIZE_SCALAR, ATR_BLOCK_ON_HIGH_VOL,
+    LONDON_OPEN_UTC, NY_OPEN_UTC,
 )
 
 
@@ -63,12 +64,12 @@ NY_PAIR_CONFIG = {
 }
 
 # ── European range window (UTC hours) ──────────────────────────
-EUROPEAN_RANGE_START = 9    # 09:00 UTC — London open momentum begins
-EUROPEAN_RANGE_END   = 13   # 13:00 UTC — NY open starts
+EUROPEAN_RANGE_START = LONDON_OPEN_UTC + 2  # skip volatile opening hour
+EUROPEAN_RANGE_END   = NY_OPEN_UTC          # consolidation ends at NY open
 
 # ── NY entry window (UTC hours) ────────────────────────────────
-NY_ENTRY_START = 13   # 13:00 UTC — NY session opens
-NY_ENTRY_END   = 15   # 15:00 UTC — early-NY momentum window closes
+NY_ENTRY_START = NY_OPEN_UTC       # NY session opens
+NY_ENTRY_END   = NY_OPEN_UTC + 2   # early-NY momentum window (2-hour window)
 
 
 class NYBreakout:

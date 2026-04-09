@@ -13,7 +13,7 @@ from risk.manager import RiskManager
 from strategies.london_breakout import LondonBreakout
 from strategies.ny_breakout import NYBreakout
 from strategies.tokyo_breakout import TokyoBreakout
-from config import PAIRS, PRIMARY_PAIR, LOG_DIR
+from config import PAIRS, PRIMARY_PAIR, LOG_DIR, LONDON_OPEN_UTC, NY_OPEN_UTC
 
 # ── DRY RUN FLAG ───────────────────────────────────────────────
 # Set to False only when you're ready to place real practice orders
@@ -220,8 +220,8 @@ def run_cycle(client, risk, executor, breakout, dry_run: bool, ny_breakout=None,
         else:
             print(f"\n[Tokyo Executor] No signals to execute.")
 
-        # EUR/JPY force-close at 07:00 UTC before London open
-        if now.hour >= 7:
+        # EUR/JPY force-close at London open UTC before London session begins
+        if now.hour >= LONDON_OPEN_UTC:
             to_close = tokyo_breakout.get_positions_to_close(open_trades)
             if to_close:
                 print(f"\n[Tokyo] Force-closing {len(to_close)} EUR/JPY position(s) before London open.")
@@ -265,8 +265,9 @@ def run_cycle(client, risk, executor, breakout, dry_run: bool, ny_breakout=None,
 # ── Scheduler helpers ───────────────────────────────────────────
 
 def _in_london_window(now: datetime) -> bool:
-    """True during 06:45–09:00 UTC."""
-    return (now.hour == 6 and now.minute >= 45) or (now.hour == 7) or (now.hour == 8)
+    """True during the 15-min pre-scan buffer through London open + 1 hour (DST-aware)."""
+    pre = LONDON_OPEN_UTC - 1
+    return (now.hour == pre and now.minute >= 45) or (now.hour == LONDON_OPEN_UTC) or (now.hour == LONDON_OPEN_UTC + 1)
 
 
 def _in_tokyo_window(now: datetime) -> bool:
@@ -277,7 +278,8 @@ def _in_tokyo_window(now: datetime) -> bool:
 def _in_scan_window(now: datetime, enable_ny: bool = False, enable_tokyo: bool = False) -> bool:
     """True during any active scan window."""
     if enable_ny:
-        ny = (now.hour == 12 and now.minute >= 45) or (now.hour == 13) or (now.hour == 14)
+        ny_pre = NY_OPEN_UTC - 1
+        ny = (now.hour == ny_pre and now.minute >= 45) or (now.hour == NY_OPEN_UTC) or (now.hour == NY_OPEN_UTC + 1)
     else:
         ny = False
     tokyo = _in_tokyo_window(now) if enable_tokyo else False
@@ -287,10 +289,10 @@ def _in_scan_window(now: datetime, enable_ny: bool = False, enable_tokyo: bool =
 def _next_window_start(now: datetime, enable_ny: bool = False, enable_tokyo: bool = False) -> datetime:
     """Returns the next scan window start strictly after now."""
     candidates = []
-    today_london = now.replace(hour=6,  minute=45, second=0, microsecond=0)
+    today_london = now.replace(hour=LONDON_OPEN_UTC - 1, minute=45, second=0, microsecond=0)
     candidates.append(today_london)
     if enable_ny:
-        candidates.append(now.replace(hour=12, minute=45, second=0, microsecond=0))
+        candidates.append(now.replace(hour=NY_OPEN_UTC - 1, minute=45, second=0, microsecond=0))
     if enable_tokyo:
         candidates.append(now.replace(hour=1,  minute=45, second=0, microsecond=0))
     future = [t for t in candidates if t > now]
@@ -308,6 +310,7 @@ def _seconds_until(target: datetime, now: datetime) -> float:
 def main_once(dry_run: bool, enable_ny: bool = False, enable_tokyo: bool = False):
     """Single-shot run (original behaviour)."""
     print("\n[Forex Bot] Starting up...")
+    print(f"[Session]   London open: {LONDON_OPEN_UTC:02d}:00 UTC | NY open: {NY_OPEN_UTC:02d}:00 UTC")
     if dry_run:
         print("[Forex Bot] ⚠️  DRY RUN MODE — no orders will be placed.\n")
 
@@ -347,10 +350,10 @@ def main_loop(dry_run: bool, enable_ny: bool = False, enable_tokyo: bool = False
     """
     Continuous loop mode.
 
-    Sleeps until 06:45 UTC, then polls every 15 minutes through 09:00 UTC.
-    After the window closes, sleeps until the next active window.
-    Resets fired-today state at midnight UTC.
-    With --ny:    also scans 12:45–15:00 UTC for the NY open breakout.
+    Sleeps until 15 minutes before London open (DST-aware), then polls every
+    15 minutes through the session window. After the window closes, sleeps
+    until the next active window. Resets fired-today state at midnight UTC.
+    With --ny:    also scans 15 min before NY open for the NY open breakout.
     With --tokyo: also scans 01:45–06:00 UTC for the Tokyo breakout.
     """
     print("\n[Forex Bot] Starting in LOOP mode...")

@@ -12,6 +12,8 @@ from config import (
     BREAKOUT_ASIAN_MIN_PIPS,
     MOMENTUM_BODY_RATIO,
     ATR_VOLATILITY_MULTIPLIER, ATR_HIGH_VOL_SIZE_SCALAR, ATR_BLOCK_ON_HIGH_VOL,
+    ATR_STOP_MULTIPLIER,
+    LONDON_OPEN_UTC,
 )
 
 
@@ -103,7 +105,7 @@ class LondonBreakout:
     MIN_RANGE_PIPS   = BREAKOUT_ASIAN_MIN_PIPS
     MAX_RANGE_PIPS   = 80
     REWARD_RISK      = 2.5
-    LONDON_OPEN_HOUR = 7
+    LONDON_OPEN_HOUR = LONDON_OPEN_UTC
 
     def __init__(
         self,
@@ -329,7 +331,7 @@ class LondonBreakout:
 
         # 10. Calculate levels
         stop_loss, take_profit, stop_pips, target_pips = self._calculate_levels(
-            direction, entry_price, asian, pair
+            direction, entry_price, asian, pair, atr_regime["current_atr"]
         )
 
         # 11. RR check
@@ -433,14 +435,24 @@ class LondonBreakout:
         entry:       float,
         asian:       dict,
         pair:        str,
+        current_atr: float = 0.0,
     ) -> tuple[float, float, float, float]:
-        pip = self.md.pips_to_price(BREAKOUT_BUFFER_PIPS, pair)
+        if current_atr > 0:
+            atr_dist = ATR_STOP_MULTIPLIER * current_atr
+            if direction == "buy":
+                stop_loss = entry - atr_dist
+            else:
+                stop_loss = entry + atr_dist
+        else:
+            pip = self.md.pips_to_price(BREAKOUT_BUFFER_PIPS, pair)
+            if direction == "buy":
+                stop_loss = asian["low"] - pip
+            else:
+                stop_loss = asian["high"] + pip
 
         if direction == "buy":
-            stop_loss   = asian["low"] - pip
             take_profit = entry + (entry - stop_loss) * self.REWARD_RISK
         else:
-            stop_loss   = asian["high"] + pip
             take_profit = entry - (stop_loss - entry) * self.REWARD_RISK
 
         stop_pips   = self.md.price_to_pips(abs(entry - stop_loss), pair)
@@ -472,7 +484,7 @@ class LondonBreakout:
     # ── Helpers ────────────────────────────────────────────────
 
     def _in_breakout_window(self, now: datetime) -> bool:
-        return 7 <= now.hour < 9
+        return LONDON_OPEN_UTC <= now.hour < LONDON_OPEN_UTC + 2
 
     def reset_daily(self):
         self._fired_today.clear()
